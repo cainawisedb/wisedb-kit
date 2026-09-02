@@ -37,43 +37,75 @@ for SID in "${SIDS[@]}"; do
 
   #--- Consultas SQL (somente SELECT) -----------------------------------------
   sqlplus -S / as sysdba >> "${F}_sql.txt" 2>&1 <<'EOF'
-set pages 200 lines 220 trimspool on
+set pages 200 lines 200 trimspool on feedback off
 col name for a15
-col value for a60
-prompt ################ IDENTIFICACAO DO BANCO ################
-select name, dbid, database_role, log_mode, open_mode, created from v$database;
+col value for a55
+prompt ### IDENTIFICACAO
+select name, dbid, database_role role, log_mode, open_mode, created from v$database;
 select banner_full from v$version where rownum=1;
-select instance_name, host_name, status, startup_time from v$instance;
-prompt ################ TAMANHO DO BANCO (GB) ################
-select round(sum(bytes)/1024/1024/1024,2) size_gb from dba_data_files;
-prompt ################ FRA / DESTINOS DE ARCHIVE ################
+select instance_name, host_name, status, to_char(startup_time,'DD/MM/YYYY HH24:MI') startup from v$instance;
+prompt ### PDBs (multitenant)
+col pdb for a25
+select name pdb, open_mode, restricted from v$pdbs order by name;
+prompt ### TAMANHO REAL (CDB + PDBs, GB)
+select round(sum(bytes)/1024/1024/1024,2) total_gb from cdb_data_files;
+select con_id, round(sum(bytes)/1024/1024/1024,2) gb from cdb_data_files group by con_id order by 1;
+prompt ### DESTINOS DE ARCHIVE / FRA
 show parameter db_recovery_file_dest
 show parameter log_archive_dest_1
-prompt ################ HISTORICO RMAN - ULTIMOS 35 DIAS ################
-col input_type for a14
-col status for a24
-col inicio for a17
-col fim for a17
-select session_key, input_type, status,
-       to_char(start_time,'DD/MM/YYYY HH24:MI') inicio,
-       to_char(end_time,'DD/MM/YYYY HH24:MI') fim,
-       round(input_bytes/1024/1024/1024,2)  input_gb,
+prompt ### RMAN 35 DIAS - RESUMO AGREGADO POR TIPO
+col input_type for a12
+col primeiro for a16
+col ultimo for a16
+select input_type,
+       count(*) execucoes,
+       sum(case when status like 'COMPLETED%' then 1 else 0 end) ok,
+       sum(case when status like '%FAILED%' then 1 else 0 end) falhas,
+       to_char(min(start_time),'DD/MM HH24:MI') primeiro,
+       to_char(max(start_time),'DD/MM HH24:MI') ultimo,
+       round(avg(output_bytes)/1024/1024/1024,2) media_gb,
+       round(max(elapsed_seconds)/60,1) max_min
+from v$rman_backup_job_details where start_time > sysdate-35
+group by input_type order by 1;
+prompt ### RMAN 35 DIAS - HORARIO TIPICO POR TIPO
+select input_type, to_char(start_time,'HH24') hora, count(*) qtd
+from v$rman_backup_job_details where start_time > sysdate-35
+group by input_type, to_char(start_time,'HH24') having count(*) > 2 order by 1,2;
+prompt ### RMAN - NIVEL 0 x NIVEL 1 (DB INCR, ultimos 35 dias)
+select to_char(start_time,'DD/MM DY HH24:MI') inicio,
        round(output_bytes/1024/1024/1024,2) output_gb,
-       round(elapsed_seconds/60,1) min
+       round(elapsed_seconds/60,1) min,
+       case when output_bytes > 100*1024*1024*1024 then 'NIVEL 0 (full)' else 'Nivel 1 (incr)' end tipo
 from v$rman_backup_job_details
-where start_time > sysdate-35
-order by start_time;
-prompt ################ ARCHIVELOG - FREQUENCIA REAL (7 DIAS) ################
-select to_char(completion_time,'DD/MM') dia, count(*) qtd_archives
+where input_type='DB INCR' and start_time > sysdate-35 order by start_time desc;
+prompt ### RMAN - FALHAS (ultimos 35 dias, detalhe)
+select to_char(start_time,'DD/MM/YYYY HH24:MI') inicio, input_type, status
+from v$rman_backup_job_details
+where start_time > sysdate-35 and status not like 'COMPLETED%' order by start_time desc fetch first 15 rows only;
+prompt ### ARCHIVELOG - VOLUME REAL POR DIA (7 DIAS)
+select to_char(completion_time,'DD/MM') dia, count(*) qtd_archives,
+       round(sum(blocks*block_size)/1024/1024/1024,1) gb
 from v$archived_log where completion_time > sysdate-7
 group by to_char(completion_time,'DD/MM') order by 1;
-prompt ################ DIRECTORIES (destinos de expdp) ################
-col directory_name for a25
-col directory_path for a80
-select directory_name, directory_path from dba_directories order by 1;
-prompt ################ JOBS DBMS_SCHEDULER de backup (se houver) ################
-col job_name for a35
-col repeat_interval for a60
+prompt ### ARCHIVELOG - MAIOR INTERVALO SEM ARCHIVE (7 DIAS, indica RPO real)
+select round(max(gap)*24*60) maior_gap_min from (
+  select completion_time - lag(completion_time) over (order by completion_time) gap
+  from v$archived_log where completion_time > sysdate-7);
+prompt ### BACKUPSETS EM DISCO x SBT (onde as copias realmente estao)
+select device_type, count(*) pecas, round(sum(bytes)/1024/1024/1024,2) gb,
+       to_char(max(completion_time),'DD/MM HH24:MI') mais_recente
+from v$backup_piece_details where completion_time > sysdate-35
+group by device_type order by 1;
+prompt ### CONTROLFILE AUTOBACKUP (evidencia do catalogo de metadados)
+select count(*) autobackups_35d, to_char(max(completion_time),'DD/MM/YYYY HH24:MI') ultimo
+from v$backup_piece_details where autobackup_date is not null and completion_time > sysdate-35;
+prompt ### DIRECTORIES nao padrao (destinos de expdp)
+col directory_path for a70
+select directory_name, directory_path from dba_directories
+where directory_path not like '%/dbhome%' and directory_path not like '/u01/app/oracle' order by 1;
+prompt ### JOBS DBMS_SCHEDULER de backup
+col job_name for a40
+col repeat_interval for a45
 select owner||'.'||job_name job_name, enabled, state, repeat_interval
 from dba_scheduler_jobs
 where upper(job_name) like '%BKP%' or upper(job_name) like '%BACKUP%' or upper(job_name) like '%EXP%';
@@ -83,8 +115,7 @@ EOF
   #--- Configuracao e catalogo RMAN (somente SHOW/LIST) -------------------------
   rman target / >> "${F}_rman.txt" 2>&1 <<'EOF'
 SHOW ALL;
-LIST BACKUP SUMMARY COMPLETED AFTER 'SYSDATE-15';
-LIST BACKUP OF CONTROLFILE COMPLETED AFTER 'SYSDATE-15';
+SHOW ENCRYPTION ALGORITHM;
 REPORT NEED BACKUP;
 REPORT UNRECOVERABLE;
 exit

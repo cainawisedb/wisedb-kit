@@ -119,7 +119,7 @@ curl -fsSL "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null 2>/dev/null || \
 titulo "FASE 1 - DESCOBERTA DO AMBIENTE"
 tem(){ command -v "$1" >/dev/null 2>&1; }
 
-VM_TENANCY=""; VM_COMPART=""; VM_NOME_OCI=""; VM_REGIAO=""; NA_OCI=0
+VM_TENANCY=""; VM_COMPART=""; VM_NOME_OCI=""; VM_REGIAO=""; NA_OCI=0; MD_CONFIAVEL=1
 if curl -fsSL -m 3 -H "Authorization: Bearer Oracle" \
      http://169.254.169.254/opc/v2/instance/ -o "$TMP/_md.json" 2>/dev/null; then
   NA_OCI=1
@@ -128,7 +128,12 @@ if curl -fsSL -m 3 -H "Authorization: Bearer Oracle" \
   VM_NOME_OCI=$(grep -o '"displayName"[^,]*' "$TMP/_md.json" | cut -d'"' -f4)
   VM_REGIAO=$(grep -o '"canonicalRegionName"[^,]*' "$TMP/_md.json" | cut -d'"' -f4)
   ok "Esta maquina E uma instancia OCI: ${NEG}${VM_NOME_OCI:-?}${R} (regiao ${VM_REGIAO:-?})"
-  info "Tenancy da propria VM: ${VM_TENANCY:-nao exposta}"
+  info "Tenancy reportada pelo metadata: ${VM_TENANCY:-nao exposta}"
+  case "$VM_NOME_OCI" in ocid1.dbsystem*|ocid1.autonomous*|ocid1.vmcluster*|ocid1.cloudvmcluster*)
+    MD_CONFIAVEL=0
+    warn "Servico gerenciado da OCI (DB System/Exa/ADB): o metadata devolve a tenancy do service enclave da Oracle, NAO a do cliente. Comparacao de tenancy sera apenas informativa."
+    ;;
+  esac
 else
   info "Metadata OCI nao respondeu: on-premises, outra cloud ou metadata bloqueado"
 fi
@@ -146,7 +151,11 @@ while read -r p; do
     ORA_SIDS+=("$p|(processo ativo, ausente no oratab)")
   fi
 done < <(ps -eo args 2>/dev/null | grep -o 'ora_pmon_[A-Za-z0-9_]*' | sed 's/ora_pmon_//' | sort -u)
-ORA_GERENCIADO=0; { tem dbcli || tem dbaascli; } && ORA_GERENCIADO=1
+ORA_GERENCIADO=0
+if tem dbcli || tem dbaascli; then
+  ORA_GERENCIADO=1
+  MD_CONFIAVEL=0
+fi
 if [ ${#ORA_SIDS[@]} -gt 0 ]; then
   ok "Oracle: ${#ORA_SIDS[@]} instancia(s)"
   for s in "${ORA_SIDS[@]}"; do info "  - ${s%%|*}  ${DIM}(${s##*|})${R}"; done
@@ -161,8 +170,16 @@ if pgrep -x sqlservr >/dev/null 2>&1 || systemctl is-active mssql-server >/dev/n
   ok "SQL Server ativo${SQL_PORTAS:+ (${SQL_PORTAS[*]})}"
 fi
 MY_ON=0; PG_ON=0
-{ pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; } && { MY_ON=1; ok "MySQL/MariaDB ativo"; }
-pgrep -f 'postgres.*checkpointer' >/dev/null 2>&1 && { PG_ON=1; ok "PostgreSQL ativo"; }
+if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
+  MY_ON=1; ok "MySQL/MariaDB ativo:"
+  ps -eo user,pid,args 2>/dev/null | grep -E '^\S+ +[0-9]+ +\S*(mysqld|mariadbd)' | grep -v grep | head -3 | while read -r l; do info "  $l"; done
+  warn "Confirme se este MySQL/MariaDB pertence ao cliente ou e apoio de ferramenta (ex.: Zabbix). Rotina de dump/binlog nao e coletada automaticamente."
+fi
+if pgrep -f 'postgres.*checkpointer' >/dev/null 2>&1; then
+  PG_ON=1; ok "PostgreSQL ativo:"
+  ps -eo user,pid,args 2>/dev/null | grep -E 'postgres' | grep -v grep | head -3 | while read -r l; do info "  $l"; done
+  warn "Confirme se este PostgreSQL pertence ao cliente ou e apoio de ferramenta. Rotina de pg_dump/WAL nao e coletada automaticamente."
+fi
 
 for c in docker podman; do
   if tem $c; then
@@ -325,14 +342,22 @@ if [ ${#OCI_PROF[@]} -gt 0 ]; then
     OCI_SEL_PROF="${OCI_PROF[sel]}"; OCI_SEL_TEN="${OCI_TEN[sel]}"; OCI_SEL_REG="${OCI_REG[sel]}"
     ok "Profile: ${NEG}$OCI_SEL_PROF${R} | regiao ${OCI_SEL_REG:-padrao}"
     if [ -n "$VM_TENANCY" ] && [ -n "$OCI_SEL_TEN" ] && [ "$VM_TENANCY" != "$OCI_SEL_TEN" ] && [ "$PAPEL" = "HOST_DO_CLIENTE" ]; then
-      warn "DIVERGENCIA: esta VM esta na tenancy ...${VM_TENANCY: -12} e o profile aponta para ...${OCI_SEL_TEN: -12}"
-      pergunta "Confirma que o profile e do cliente '$CLIENTE'? (s/N)" CONF "N"
-      [ "${CONF^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada por divergencia de tenancy"; }
+      if [ "$MD_CONFIAVEL" = "0" ]; then
+        info "Tenancy do metadata (...${VM_TENANCY: -12}) difere da do profile (...${OCI_SEL_TEN: -12}), esperado em servico gerenciado: nao e divergencia."
+      else
+        warn "DIVERGENCIA: esta VM esta na tenancy ...${VM_TENANCY: -12} e o profile aponta para ...${OCI_SEL_TEN: -12}"
+        pergunta "Confirma que o profile e do cliente '$CLIENTE'? (s/N)" CONF "N"
+        [ "${CONF^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada por divergencia de tenancy"; }
+      fi
     fi
     if [ -n "$OCI_SEL_PROF" ] && ! casa_cliente "$OCI_SEL_PROF"; then
-      warn "O profile '$OCI_SEL_PROF' nao lembra o nome '$CLIENTE'"
-      pergunta "Prosseguir com este profile? (s/N)" CONF2 "N"
-      [ "${CONF2^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada pelo operador"; }
+      if [ ${#OCI_PROF[@]} -eq 1 ] && [ "$PAPEL" != "ESTACAO_COLETA_WISEDB" ]; then
+        info "Profile unico '$OCI_SEL_PROF' neste host: nome generico e esperado, seguindo sem bloqueio."
+      else
+        warn "O profile '$OCI_SEL_PROF' nao lembra o nome '$CLIENTE' e ha ${#OCI_PROF[@]} profiles neste host"
+        pergunta "Prosseguir com este profile? (s/N)" CONF2 "N"
+        [ "${CONF2^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada pelo operador"; }
+      fi
     fi
     if [ -n "$OCI_SEL_PROF" ]; then
       if oci --profile "$OCI_SEL_PROF" os ns get >/dev/null 2>&1 || oci --profile "$OCI_SEL_PROF" iam region list >/dev/null 2>&1; then
@@ -385,13 +410,15 @@ pergunta "Executar a coleta com este plano? (S/n)" GO "S"
 # FASE 6 - COLETA
 #===============================================================================
 titulo "FASE 6 - COLETA (somente leitura)"
-dl(){ local m="$1"
-  if   [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$TMP/$m"
-  elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$TMP/$m"
-  else curl -fsSL "$BASE_URL/$m" -o "$TMP/$m" || { erro "Falha ao baixar $m"; return 1; }
-       [ -s "$TMP/$m" ] || { erro "$m veio vazio"; return 1; }
+dl(){ local m="$1"; local dest="${TMP_DIGEST:-$TMP}"
+  [ "$m" = "wisedb_digest.py" ] || dest="$TMP"
+  mkdir -p "$dest"
+  if   [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$dest/$m"
+  elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$dest/$m"
+  else curl -fsSL "$BASE_URL/$m" -o "$dest/$m" || { erro "Falha ao baixar $m"; return 1; }
+       [ -s "$dest/$m" ] || { erro "$m veio vazio"; return 1; }
   fi
-  chmod +x "$TMP/$m"; }
+  chmod +x "$dest/$m"; }
 
 cd "$WORK"
 if [ "$COLETA_LOCAL" = "1" ]; then
@@ -410,6 +437,7 @@ else
   ok "Coleta local suprimida; contexto da estacao registrado em arquivo separado"
 fi
 if [ -n "$OCI_SEL_PROF" ]; then
+  info "Coleta OCI iniciada. Em tenancies com muitos compartments isso pode levar varios minutos; aguarde sem interromper."
   dl 05_coleta_oci.sh && bash "$TMP/05_coleta_oci.sh" --profile "$OCI_SEL_PROF" \
      ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" && ok "OCI coletado (tenancy do cliente)"
 fi
@@ -426,6 +454,8 @@ while IFS= read -r -d '' f; do
     -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
     -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' "$f"
 done
+TMP_DIGEST="$WORK/.digest"; mkdir -p "$TMP_DIGEST"
+[ -f "$TMP/wisedb_digest.py" ] && cp "$TMP/wisedb_digest.py" "$TMP_DIGEST/" 2>/dev/null
 rm -rf "$TMP"
 
 FINAL="$WORK/resultado_final.txt"
@@ -458,15 +488,15 @@ FINAL="$WORK/resultado_final.txt"
   done
 } > "$FINAL"
 
-python3 - "$WORK" "$CLIENTE" "$PAPEL" "$COLETA_LOCAL" "$OCI_SEL_PROF" "$OCI_SEL_TEN" "$VM_TENANCY" "$RPO" "$RTO" <<'PYEOF' 2>/dev/null || warn "python3 ausente: resultado.json nao gerado (o .txt esta completo)"
+python3 - "$WORK" "$CLIENTE" "$PAPEL" "$COLETA_LOCAL" "$OCI_SEL_PROF" "$OCI_SEL_TEN" "$VM_TENANCY" "$RPO" "$RTO" "$MD_CONFIAVEL" <<'PYEOF' 2>/dev/null || warn "python3 ausente: resultado.json nao gerado (o .txt esta completo)"
 import json, os, sys, datetime
-w, cli, papel, local, prof, ten, vmten, rpo, rto = sys.argv[1:10]
+w, cli, papel, local, prof, ten, vmten, rpo, rto, mdok = sys.argv[1:11]
 pend = []
 if rpo.startswith("A combinar"): pend.append("RPO nao definido formalmente")
 if rto.startswith("A combinar"): pend.append("RTO nao definido formalmente")
 if local == "0": pend.append("Host de ferramenta: ambiente local do cliente deve ser coletado no servidor do cliente")
 if not prof: pend.append("Coleta OCI nao executada nesta rodada")
-if vmten and ten and vmten != ten: pend.append("Tenancy da VM difere da do profile: escopo validado manualmente")
+if vmten and ten and vmten != ten and mdok == "1": pend.append("Tenancy da VM difere da do profile: escopo validado manualmente")
 doc = {
  "schema": "wisedb.coleta.backup/v2",
  "cliente": cli,
@@ -475,8 +505,9 @@ doc = {
             "data": datetime.datetime.now().isoformat(timespec="minutes"),
             "script_versao": "3.0"},
  "oci": {"profile_usado": prof or None, "tenancy_profile": ten or None,
-         "tenancy_da_vm_local": vmten or None,
-         "tenancy_conferida": bool(prof and ten and (not vmten or vmten == ten))},
+         "tenancy_reportada_pelo_metadata": vmten or None,
+         "metadata_confiavel": mdok == "1",
+         "tenancy_conferida": bool(prof and ten and (mdok == "0" or not vmten or vmten == ten))},
  "escopo": {"rpo_informado": rpo, "rto_informado": rto},
  "evidencias": sorted(os.path.relpath(os.path.join(r,f), w)
      for r,_,fs in os.walk(w) for f in fs if f.endswith((".txt",".log",".json")) and f != "resultado.json"),
@@ -485,6 +516,13 @@ doc = {
 open(os.path.join(w,"resultado.json"),"w",encoding="utf-8").write(json.dumps(doc, ensure_ascii=False, indent=2))
 print("resultado.json gerado")
 PYEOF
+
+# ---- RESUMO COMPACTO (o que voce cola na IA) -------------------------------
+RESUMO="$WORK/RESUMO_${CLIENTE// /_}_${HOSTN}.txt"
+if dl wisedb_digest.py 2>/dev/null; then
+  python3 "$TMP_DIGEST/wisedb_digest.py" "$WORK" "$CLIENTE" "$PAPEL" "$RESUMO" 2>/dev/null \
+    || warn "Digest nao gerado; use o resultado_final.txt"
+fi
 
 titulo "RESUMO FINAL"
 say "  Cliente ...........: ${NEG}$CLIENTE${R}"
@@ -499,9 +537,14 @@ if [ "${OKF^^}" != "N" ]; then
   tar -czf "$PAC" -C "$ORIG_DIR" "$(basename "$WORK")"
   say ""
   say "  ${VERD}${NEG}PRONTO${R}"
-  say "  Pacote ....: $PAC"
-  say "  Para a IA .: $FINAL"
-  say "  Ver com ...: ${DIM}cat \"$FINAL\"${R}"
+  say "  Pacote completo ..: $PAC"
+  if [ -s "$RESUMO" ]; then
+    say "  ${LAR}${NEG}COLE ISTO NA IA${R}: $RESUMO  ${DIM}($(wc -l < "$RESUMO") linhas)${R}"
+    say "  Ver com ..........: ${DIM}cat \"$RESUMO\"${R}"
+    say "  Bruto completo ...: $FINAL ${DIM}(so se a IA pedir detalhe)${R}"
+  else
+    say "  Para a IA ........: $FINAL"
+  fi
 else
   info "Pacote nao gerado. Arquivos em $WORK"
 fi

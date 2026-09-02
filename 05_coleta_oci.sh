@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
 done
 [ -z "$TENANCY" ] && { echo "Informe --tenancy <ocid>"; exit 1; }
 
+export PYTHONWARNINGS="ignore"
 OCI="oci --profile $PROFILE"
 [ -n "$REGION" ] && OCI="$OCI --region $REGION"
 OUT="./coleta_oci_${PROFILE}_$(date +%Y%m%d)"
@@ -75,11 +76,11 @@ for C in "${COMPS[@]}"; do
 
   run 22_volume_backups_30d.txt "Boot volume backups (amostra recente, $C)" \
     "$OCI bv boot-volume-backup list --compartment-id $C --all --sort-by TIMECREATED --sort-order DESC \
-     --query 'data[0:60].{nome:\"display-name\", tipo:type, origem:\"source-type\", criado:\"time-created\", estado:\"lifecycle-state\", gb:\"unique-size-in-gbs\"}' --output table"
+     --query 'data[0:25].{nome:\"display-name\", tipo:type, origem:\"source-type\", criado:\"time-created\", estado:\"lifecycle-state\", gb:\"unique-size-in-gbs\"}' --output table"
 
   run 23_block_volume_backups_30d.txt "Block volume backups (amostra recente, $C)" \
     "$OCI bv backup list --compartment-id $C --all --sort-by TIMECREATED --sort-order DESC \
-     --query 'data[0:60].{nome:\"display-name\", tipo:type, criado:\"time-created\", estado:\"lifecycle-state\"}' --output table"
+     --query 'data[0:25].{nome:\"display-name\", tipo:type, criado:\"time-created\", estado:\"lifecycle-state\"}' --output table"
 done
 
 run 24_politicas_backup_definidas.txt "Politicas de volume backup (Gold/Silver/Bronze e customizadas)" \
@@ -109,7 +110,7 @@ for B in "${BUCKETS[@]}"; do
   run 31_bucket_${B}_retention.txt "Retention rules do bucket $B (IMUTABILIDADE)" \
     "$OCI os retention-rule list --bucket-name $B --namespace $NS --output json"
   run 31_bucket_${B}_objetos.txt "Amostra de objetos recentes do bucket $B" \
-    "$OCI os object list --bucket-name $B --namespace $NS --limit 80 \
+    "$OCI os object list --bucket-name $B --namespace $NS --limit 25 \
      --fields name,size,timeCreated --query 'data[].{objeto:name, bytes:size, criado:\"time-created\"}' --output table"
 done
 
@@ -120,7 +121,7 @@ for C in "${COMPS[@]}"; do
      --query 'data[].{nome:\"display-name\", estado:\"lifecycle-state\", edicao:\"database-edition\", ocid:id}' --output table"
   run 41_db_backups.txt "Backups de databases OCI-managed ($C)" \
     "$OCI db backup list --compartment-id $C --all \
-     --query 'data[0:60].{nome:\"display-name\", tipo:type, inicio:\"time-started\", fim:\"time-ended\", estado:\"lifecycle-state\"}' --output table"
+     --query 'data[0:25].{nome:\"display-name\", tipo:type, inicio:\"time-started\", fim:\"time-ended\", estado:\"lifecycle-state\"}' --output table"
   run 42_autonomous.txt "Autonomous Databases e retencao ($C)" \
     "$OCI db autonomous-database list --compartment-id $C --all \
      --query 'data[].{nome:\"display-name\", estado:\"lifecycle-state\", retencao_dias:\"backup-retention-period-in-days\"}' --output table"
