@@ -15,6 +15,22 @@ irm https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/kit_coleta_backup/w
 
 Para apontar outro repositório sem editar o script: `export WISEDB_BASE_URL="https://.../kit_coleta_backup"` antes de rodar (Linux) ou `$env:WISEDB_BASE_URL = "..."` (Windows). Repositório privado funciona incluindo o token de leitura na URL raw.
 
+
+### Blindagens do wizard (v3.0)
+
+O wizard nunca assume que o servidor onde roda pertence ao cliente. Antes de coletar, ele:
+
+1. **Classifica o papel do host**: HOST DO CLIENTE, ESTAÇÃO DE COLETA/BASTION WiseDB ou HOST MISTO. Em estação de coleta, os dados locais (cron, discos, bases) são suprimidos da política e gravados em `contexto_estacao_NAO_DO_CLIENTE.txt`.
+2. **Pontua sinais de host de ferramenta**: múltiplos profiles OCI de tenancies distintas, hostname com bastion/jump/wise/monitor/zabbix/relatorio/mgmt, presença de OCI CLI sem SGBD local.
+3. **Lista tudo o que encontrou** antes de qualquer escolha: todas as instâncias Oracle (oratab + processos órfãos), todos os profiles OCI com região e tenancy, todos os crontabs por usuário, todos os diretórios candidatos a repositório (descobertos por varredura de cron, mounts e filesystem, não por lista fixa).
+4. **Cruza a tenancy real da própria VM** (metadata service da OCI, sem credencial) com a tenancy do profile escolhido, e exige confirmação explícita em caso de divergência.
+5. **Confere o nome do cliente** contra hostname, nome da instância OCI e nomes de profiles, com match bidirecional, e alerta quando não há correspondência.
+6. **Valida a autenticação do profile** OCI antes de coletar, para não gerar evidência vazia.
+7. **Alerta situações que mudam a interpretação do backup**: RAC/Clusterware (job pode rodar em outro nó), dbcli/dbaascli (backup gerenciado pela OCI e não por cron), containers com banco (coleta não entra no container), cron inacessível pelo usuário atual.
+8. **Exibe o plano completo e pede confirmação** antes de executar, e registra todos os alertas no `resultado_final.txt` e no `resultado.json`.
+
+Navegação: setas ou j/k, ESPAÇO marca em listas múltiplas, `a` marca todos, `n` desmarca, ENTER confirma. Sem terminal interativo, o script usa padrões conservadores.
+
 ## Modo manual (módulos individuais)
 
 Todos os scripts são **somente leitura** e seguros para produção. Nenhum deles altera banco, servidor ou OCI. Nenhum deles armazena senha.

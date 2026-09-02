@@ -1,144 +1,424 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
+# v3.0 - Wizard blindado (papel do host, multi-tenancy, coerencia de escopo)
 #
-# CONCEITO : Automatico first. Um unico comando no servidor alvo:
+# USO:
+#   export WISEDB_BASE_URL="https://raw.githubusercontent.com/SUAORG/wisedb-kit/main"
+#   bash <(curl -fsSL "$WISEDB_BASE_URL/wisedb_coleta_auto.sh")
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/wisedb_coleta_auto.sh)
+# PRINCIPIO CRITICO DESTA VERSAO:
+#   Nunca assumir que o servidor onde o script roda pertence ao cliente.
+#   Um bastion/jump da WiseDB com N profiles OCI NAO e ambiente do cliente:
+#   seus dados locais (cron, discos, bases) sao contexto de FERRAMENTA e sao
+#   marcados como NAO APLICAVEIS A POLITICA. Somente a coleta remota da
+#   tenancy escolhida entra como evidencia do cliente.
 #
-# FLUXO    : 1) DETECTA o ambiente (Oracle, SQL Server, MySQL/MariaDB,
-#               PostgreSQL, Proxmox/PBS, KVM, OCI CLI, Veeam Agent, cron)
-#            2) WIZARD de confirmacao: incluir/remover itens e marcar
-#               ambientes FORA do escopo da politica (com justificativa)
-#            3) BAIXA da mesma origem apenas os modulos necessarios
-#               (01, 02, 03, 05, 07b) e executa a coleta read-only
-#            4) SANITIZA segredos, mostra o RESUMO e pede o OK final
-#            5) GERA: resultado_final.txt (colar na IA junto com o Modelo)
-#                     resultado.json     (estruturado p/ integracoes futuras)
-#                     pacote .tar.gz
-# RISCO    : Zero no ambiente. Somente leitura.
+# RISCO: Zero no ambiente. Somente leitura.
 #===============================================================================
 set -uo pipefail
 
-BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/kit_coleta_backup}"
-VERSAO="2.0"
+BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
+VERSAO="3.0"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
+FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
 ORIG_DIR="$(pwd)"
 WORK="$ORIG_DIR/wisedb_coleta_${HOSTN}_${DATA}"
 TMP="$WORK/.modulos"
 mkdir -p "$TMP"
 
-# Entrada interativa funciona mesmo em "curl | bash" lendo de /dev/tty.
-if [ -e /dev/tty ]; then TTY=/dev/tty; INTERATIVO=1; else TTY=/dev/null; INTERATIVO=0; fi
-ask(){ local msg="$1"; local var="$2"; local pad="${3:-}"
-  if [ "$INTERATIVO" = "1" ]; then
-    printf "%s" "$msg" > "$TTY"; IFS= read -r "$var" < "$TTY"
-    [ -z "${!var}" ] && printf -v "$var" '%s' "$pad"
-  else printf -v "$var" '%s' "$pad"; fi
+#---------------------------- UI: cores e helpers -------------------------------
+if [ -t 1 ] || [ -e /dev/tty ]; then
+  LAR=$'\033[38;5;208m'; CINZA=$'\033[38;5;250m'; MAR=$'\033[38;5;39m'
+  MARBG=$'\033[48;5;17m'; VERD=$'\033[38;5;40m'; VERM=$'\033[38;5;196m'
+  AMAR=$'\033[38;5;220m'; NEG=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+else
+  LAR=""; CINZA=""; MAR=""; MARBG=""; VERD=""; VERM=""; AMAR=""; NEG=""; DIM=""; R=""
+fi
+if [ -e /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then TTY=/dev/tty; INTER=1; else TTY=""; INTER=0; fi
+
+ALERTAS=()
+say(){ printf "%b\n" "$*"; }
+titulo(){ say ""; say "${MARBG}${LAR}${NEG}  $*  ${R}"; }
+info(){ say "  ${CINZA}$*${R}"; }
+ok(){ say "  ${VERD}OK${R}  $*"; }
+warn(){ say "  ${AMAR}!${R}   $*"; ALERTAS+=("$*"); }
+erro(){ say "  ${VERM}X${R}   $*"; }
+
+pergunta(){ # pergunta "label" var "default"
+  local label="$1" var="$2" def="${3:-}" resp=""
+  if [ "$INTER" = "1" ]; then
+    printf "%b" "  ${LAR}?${R} ${NEG}$label${R}${def:+ ${DIM}[$def]${R}}: " > "$TTY"
+    IFS= read -r resp < "$TTY"
+  fi
+  [ -z "$resp" ] && resp="$def"
+  printf -v "$var" '%s' "$resp"
 }
 
-echo "==============================================================="
-echo " WiseDB - Coleta Automatica de Backup v$VERSAO | $HOSTN | $(date '+%d/%m/%Y %H:%M')"
-echo "==============================================================="
+MENU_SEL=()
+menu_sel(){ # menu_sel single|multi "titulo" item...
+  local modo="$1" tit="$2"; shift 2
+  local -a itens=("$@")
+  local n=${#itens[@]} cur=0 i
+  local -a marc; for ((i=0;i<n;i++)); do marc[i]=0; done
+  MENU_SEL=()
+  [ "$n" -eq 0 ] && return 0
+  if [ "$INTER" = "0" ]; then [ "$modo" = "single" ] && MENU_SEL=(0); return 0; fi
+  while :; do
+    {
+      printf "\n  ${NEG}%s${R}\n" "$tit"
+      if [ "$modo" = "multi" ]; then
+        printf "  ${DIM}setas ou j/k move | ESPACO marca | a=todos | n=nenhum | ENTER confirma${R}\n"
+      else
+        printf "  ${DIM}setas ou j/k move | numero seleciona direto | ENTER confirma${R}\n"
+      fi
+      for ((i=0;i<n;i++)); do
+        local cursor="  " box=""
+        [ "$i" -eq "$cur" ] && cursor="${LAR}>${R} "
+        if [ "$modo" = "multi" ]; then
+          [ "${marc[i]}" = "1" ] && box="${VERD}[x]${R} " || box="${CINZA}[ ]${R} "
+        else
+          [ "$i" -eq "$cur" ] && box="${LAR}(o)${R} " || box="${CINZA}( )${R} "
+        fi
+        printf "  %b%b%b\n" "$cursor" "$box" "${itens[i]}"
+      done
+    } > "$TTY"
+    local k rest
+    IFS= read -rsn1 k < "$TTY"
+    case "$k" in
+      $'\033') IFS= read -rsn2 -t 0.1 rest < "$TTY" || rest=""
+               case "$rest" in "[A") [ "$cur" -gt 0 ] && cur=$((cur-1));; "[B") [ "$cur" -lt $((n-1)) ] && cur=$((cur+1));; esac;;
+      k|K) [ "$cur" -gt 0 ] && cur=$((cur-1));;
+      j|J) [ "$cur" -lt $((n-1)) ] && cur=$((cur+1));;
+      " ") [ "$modo" = "multi" ] && marc[cur]=$((1-marc[cur]));;
+      a|A) [ "$modo" = "multi" ] && for ((i=0;i<n;i++)); do marc[i]=1; done;;
+      n|N) [ "$modo" = "multi" ] && for ((i=0;i<n;i++)); do marc[i]=0; done;;
+      ""|$'\n')
+        if [ "$modo" = "single" ]; then MENU_SEL=("$cur"); return 0
+        else for ((i=0;i<n;i++)); do [ "${marc[i]}" = "1" ] && MENU_SEL+=("$i"); done; return 0; fi;;
+      [0-9]) local idx=$((k-1))
+             if [ "$idx" -ge 0 ] && [ "$idx" -lt "$n" ]; then
+               if [ "$modo" = "single" ]; then MENU_SEL=("$idx"); return 0
+               else marc[idx]=$((1-marc[idx])); fi
+             fi;;
+    esac
+    printf "\033[%dA\033[J" $((n+3)) > "$TTY"
+  done
+}
 
-# Teste de conectividade com a origem dos modulos (evita falhas silenciosas depois)
-if ! curl -fsSL "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null 2>/dev/null; then
-  echo "[AVISO] Nao foi possivel baixar de: $BASE_URL"
-  echo "        Verifique se WISEDB_BASE_URL aponta para a pasta correta (com ou sem /kit_coleta_backup)"
-  echo "        e se o servidor tem saida HTTPS para raw.githubusercontent.com."
-fi
+say ""
+say "${MARBG}${LAR}${NEG}  WiseDB - Coleta Automatica de Backup  v$VERSAO  ${R}"
+info "Host: $FQDN | Usuario: $(whoami) | $(date '+%d/%m/%Y %H:%M %Z')"
+curl -fsSL "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null 2>/dev/null || \
+  warn "Nao foi possivel baixar modulos de $BASE_URL (verifique WISEDB_BASE_URL e saida HTTPS)"
 
-#=========================== 1. DETECCAO ========================================
-declare -A DET DESC
+#===============================================================================
+# FASE 1 - DESCOBERTA PROFUNDA (lista TUDO, nao escolhe nada)
+#===============================================================================
+titulo "FASE 1 - DESCOBERTA DO AMBIENTE"
 tem(){ command -v "$1" >/dev/null 2>&1; }
 
-DET[linux]=1;                     DESC[linux]="Servidor Linux (cron, timers, scripts, destinos)"
-if [ -s /etc/oratab ] || pgrep -f ora_pmon >/dev/null 2>&1; then DET[oracle]=1; else DET[oracle]=0; fi
-DESC[oracle]="Oracle Database ($(grep -Ev '^\s*(#|$)' /etc/oratab 2>/dev/null | cut -d: -f1 | grep -Ev '^\+ASM' | tr '\n' ' ' 2>/dev/null))"
-if pgrep -x sqlservr >/dev/null 2>&1 || systemctl is-active mssql-server >/dev/null 2>&1; then DET[sqlserver]=1; else DET[sqlserver]=0; fi
-DESC[sqlserver]="Microsoft SQL Server (processo/servico ativo)"
-if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then DET[mysql]=1; else DET[mysql]=0; fi
-DESC[mysql]="MySQL/MariaDB (registro de presenca; coleta detalhada sob demanda)"
-if pgrep -f 'postgres.*checkpointer|postmaster' >/dev/null 2>&1; then DET[postgres]=1; else DET[postgres]=0; fi
-DESC[postgres]="PostgreSQL (registro de presenca; coleta detalhada sob demanda)"
-if tem pvesh || tem proxmox-backup-manager || { tem virsh && ! tem pvesh; }; then DET[hypervisor]=1; else DET[hypervisor]=0; fi
-DESC[hypervisor]="Hypervisor Linux (Proxmox/PBS/KVM: jobs vzdump, prune, VMs sem backup)"
-if tem oci && [ -f "$HOME/.oci/config" ]; then DET[oci]=1; else DET[oci]=0; fi
-DESC[oci]="OCI CLI configurado (profiles: $(grep -oP '^\[\K[^]]+' "$HOME/.oci/config" 2>/dev/null | tr '\n' ' '))"
-if tem veeamconfig; then DET[veeamagent]=1; else DET[veeamagent]=0; fi
-DESC[veeamagent]="Veeam Agent for Linux"
-
-CRON_HINT=$( { crontab -l 2>/dev/null; cat /etc/crontab 2>/dev/null; } | grep -Eic 'backup|rman|expdp|dump|vzdump' || true)
-
-echo
-echo "Componentes detectados automaticamente:"
-i=0; ORDEM=()
-for k in linux oracle sqlserver mysql postgres hypervisor oci veeamagent; do
-  i=$((i+1)); ORDEM+=("$k")
-  [ "${DET[$k]}" = "1" ] && M="[X]" || M="[ ]"
-  echo "  $i) $M ${DESC[$k]}"
-done
-echo "  Indicios de backup no cron: $CRON_HINT linha(s)"
-
-#=========================== 2. WIZARD ==========================================
-EXCLUIDOS=()
-if [ "$INTERATIVO" = "1" ]; then
-  echo
-  echo "--- WIZARD -------------------------------------------------------------"
-  echo "Digite numeros para ligar/desligar itens (ex.: '4 5'), ENTER para aceitar."
-  ask "> " TOGGLE ""
-  for n in $TOGGLE; do
-    k="${ORDEM[$((n-1))]:-}"; [ -n "$k" ] && DET[$k]=$((1-${DET[$k]}))
-  done
-  while :; do
-    ask "Marcar algum ambiente/base como FORA do escopo da politica? (nome ou ENTER p/ seguir): " ITEM ""
-    [ -z "$ITEM" ] && break
-    ask "  Justificativa para '$ITEM': " JUST "Nao informado"
-    EXCLUIDOS+=("$ITEM|$JUST")
-  done
-fi
-ask "Nome do cliente: " CLIENTE "NAO_INFORMADO"
-ask "RPO acordado (ENTER se nao definido): " RPO "A combinar com o cliente"
-ask "RTO acordado (ENTER se nao definido): " RTO "A combinar com o cliente"
-
-# Parametros condicionais
-SQL_USER=""; OCI_PROFILE=""; OCI_TENANCY=""; OCI_REGION=""
-[ "${DET[sqlserver]}" = "1" ] && ask "Usuario de LEITURA do SQL Server (senha sera pedida na hora): " SQL_USER "wisedb_ro"
-if [ "${DET[oci]}" = "1" ]; then
-  P1=$(grep -oP '^\[\K[^]]+' "$HOME/.oci/config" 2>/dev/null | head -1)
-  ask "Profile OCI [$P1]: " OCI_PROFILE "$P1"
-  OCI_TENANCY=$(awk -v p="[$OCI_PROFILE]" '$0==p{f=1;next} /^\[/{f=0} f&&/^tenancy/{print $NF}' "$HOME/.oci/config" | tr -d ' =' | sed 's/tenancy//')
-  OCI_REGION=$(awk -v p="[$OCI_PROFILE]" '$0==p{f=1;next} /^\[/{f=0} f&&/^region/{print $NF}' "$HOME/.oci/config" | tr -d ' =' | sed 's/region//')
-  echo "  Tenancy detectada: ${OCI_TENANCY:-nao encontrada} | Regiao: ${OCI_REGION:-padrao}"
+VM_TENANCY=""; VM_COMPART=""; VM_NOME_OCI=""; VM_REGIAO=""; NA_OCI=0
+if curl -fsSL -m 3 -H "Authorization: Bearer Oracle" \
+     http://169.254.169.254/opc/v2/instance/ -o "$TMP/_md.json" 2>/dev/null; then
+  NA_OCI=1
+  VM_TENANCY=$(grep -o '"tenantId"[^,]*' "$TMP/_md.json" | cut -d'"' -f4)
+  VM_COMPART=$(grep -o '"compartmentId"[^,]*' "$TMP/_md.json" | cut -d'"' -f4)
+  VM_NOME_OCI=$(grep -o '"displayName"[^,]*' "$TMP/_md.json" | cut -d'"' -f4)
+  VM_REGIAO=$(grep -o '"canonicalRegionName"[^,]*' "$TMP/_md.json" | cut -d'"' -f4)
+  ok "Esta maquina E uma instancia OCI: ${NEG}${VM_NOME_OCI:-?}${R} (regiao ${VM_REGIAO:-?})"
+  info "Tenancy da propria VM: ${VM_TENANCY:-nao exposta}"
+else
+  info "Metadata OCI nao respondeu: on-premises, outra cloud ou metadata bloqueado"
 fi
 
-#=========================== 3. MODULOS + COLETA ================================
-dl(){ # baixa modulo do repo; se existir localmente ao lado, usa o local
-  local m="$1"
-  if [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$TMP/$m"
-  elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$TMP/$m"
-  else
-    curl -fsSL "$BASE_URL/$m" -o "$TMP/$m" || { echo "[ERRO] Falha ao baixar $m de $BASE_URL"; return 1; }
-    if [ ! -s "$TMP/$m" ]; then echo "[ERRO] $m baixado vazio (verifique BASE_URL)"; return 1; fi
+declare -a ORA_SIDS=()
+if [ -r /etc/oratab ]; then
+  while IFS=: read -r sid home rest; do
+    case "$sid" in ''|'#'*|'+ASM'*|'-MGMTDB'|agent*) continue;; esac
+    ORA_SIDS+=("$sid|${home:-home?}")
+  done < /etc/oratab
+fi
+while read -r p; do
+  [ -z "$p" ] && continue
+  if [ ${#ORA_SIDS[@]} -eq 0 ] || ! printf '%s\n' "${ORA_SIDS[@]}" | grep -q "^$p|"; then
+    ORA_SIDS+=("$p|(processo ativo, ausente no oratab)")
   fi
-  chmod +x "$TMP/$m"
+done < <(ps -eo args 2>/dev/null | grep -o 'ora_pmon_[A-Za-z0-9_]*' | sed 's/ora_pmon_//' | sort -u)
+ORA_GERENCIADO=0; { tem dbcli || tem dbaascli; } && ORA_GERENCIADO=1
+if [ ${#ORA_SIDS[@]} -gt 0 ]; then
+  ok "Oracle: ${#ORA_SIDS[@]} instancia(s)"
+  for s in "${ORA_SIDS[@]}"; do info "  - ${s%%|*}  ${DIM}(${s##*|})${R}"; done
+  [ "$ORA_GERENCIADO" = "1" ] && warn "dbcli/dbaascli presente: backup pode ser GERENCIADO pela OCI (DB System), nao por cron"
+  tem crsctl && warn "Clusterware/RAC detectado: o backup pode executar em OUTRO no do cluster"
+fi
+
+SQL_ON=0; declare -a SQL_PORTAS=()
+if pgrep -x sqlservr >/dev/null 2>&1 || systemctl is-active mssql-server >/dev/null 2>&1; then
+  SQL_ON=1
+  mapfile -t SQL_PORTAS < <(ss -lntp 2>/dev/null | grep -i sqlservr | awk '{print $4}' | sort -u)
+  ok "SQL Server ativo${SQL_PORTAS:+ (${SQL_PORTAS[*]})}"
+fi
+MY_ON=0; PG_ON=0
+{ pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; } && { MY_ON=1; ok "MySQL/MariaDB ativo"; }
+pgrep -f 'postgres.*checkpointer' >/dev/null 2>&1 && { PG_ON=1; ok "PostgreSQL ativo"; }
+
+for c in docker podman; do
+  if tem $c; then
+    CD=$($c ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -Ei 'oracle|mysql|maria|postgres|mssql|mongo' | head -5)
+    [ -n "$CD" ] && { warn "Containers com banco ($c): a coleta NAO entra no container, verificar a parte"; info "$CD"; }
+  fi
+done
+
+HYP_ON=0; VEEAM_ON=0
+{ tem pvesh || tem proxmox-backup-manager || { tem virsh && ! tem pvesh; }; } && { HYP_ON=1; ok "Hypervisor Linux detectado"; }
+tem veeamconfig && { VEEAM_ON=1; ok "Veeam Agent for Linux presente"; }
+
+declare -a OCI_PROF=() OCI_TEN=() OCI_REG=()
+OCICFG="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
+if tem oci && [ -r "$OCICFG" ]; then
+  cur=""
+  while IFS= read -r ln; do
+    ln="${ln%%#*}"; ln="$(echo "$ln" | tr -d '[:space:]')"
+    case "$ln" in
+      "["*"]") cur="${ln#[}"; cur="${cur%]}"; OCI_PROF+=("$cur"); OCI_TEN+=(""); OCI_REG+=("");;
+      tenancy=*) [ -n "$cur" ] && OCI_TEN[$((${#OCI_PROF[@]}-1))]="${ln#tenancy=}";;
+      region=*)  [ -n "$cur" ] && OCI_REG[$((${#OCI_PROF[@]}-1))]="${ln#region=}";;
+    esac
+  done < "$OCICFG"
+  ok "OCI CLI: ${#OCI_PROF[@]} profile(s) em $OCICFG"
+  for i in "${!OCI_PROF[@]}"; do info "  - ${OCI_PROF[i]}  ${DIM}${OCI_REG[i]:-regiao?} | tenancy ...${OCI_TEN[i]: -12}${R}"; done
+fi
+MULTI_TENANT=0; [ ${#OCI_PROF[@]} -gt 1 ] && MULTI_TENANT=1
+
+declare -a CRON_HITS=()
+cq(){ crontab -l ${2:+-u "$2"} 2>/dev/null | grep -Eic 'backup|rman|expdp|dump|vzdump|rsync|oci os' || true; }
+q=$(cq); [ "${q:-0}" -gt 0 ] && CRON_HITS+=("$(whoami): $q linha(s)")
+for u in oracle root mssql postgres mysql backup relatorio; do
+  [ "$u" = "$(whoami)" ] && continue
+  q=$(crontab -l -u "$u" 2>/dev/null | grep -Eic 'backup|rman|expdp|dump|vzdump|rsync|oci os' || true)
+  [ "${q:-0}" -gt 0 ] && CRON_HITS+=("$u: $q linha(s)")
+done
+q=$( { cat /etc/crontab 2>/dev/null; grep -rh '' /etc/cron.d/ 2>/dev/null; } | grep -Eic 'backup|rman|expdp|dump' || true)
+[ "${q:-0}" -gt 0 ] && CRON_HITS+=("sistema: $q linha(s)")
+if [ ${#CRON_HITS[@]} -gt 0 ]; then
+  ok "Indicios de backup no cron:"; for c in "${CRON_HITS[@]}"; do info "  - $c"; done
+else
+  warn "Nenhum indicio de backup no cron acessivel por este usuario (pode exigir root ou outro owner)"
+fi
+
+{
+  { crontab -l 2>/dev/null; cat /etc/crontab 2>/dev/null; grep -rh '' /etc/cron.d/ 2>/dev/null; } |
+    grep -Eo '/[A-Za-z0-9._/-]{4,}' | grep -Ei 'backup|bkp|dump|export' | xargs -r -n1 dirname 2>/dev/null
+  mount | awk '{print $3}' | grep -Ei 'backup|bkp|stage|^/u0'
+  ls -d /u0*/ /backup* /bkp* /stage* /var/backup* 2>/dev/null
+} 2>/dev/null | sed 's:/*$::' | sort -u | while read -r d; do [ -d "$d" ] && echo "$d"; done > "$TMP/_dirs"
+mapfile -t DIR_CAND < "$TMP/_dirs"
+if [ ${#DIR_CAND[@]} -gt 0 ]; then
+  ok "Diretorios candidatos a repositorio: ${#DIR_CAND[@]}"
+  for d in "${DIR_CAND[@]}"; do info "  - $d ${DIM}$(df -h "$d" 2>/dev/null | awk 'NR==2{print "("$2" total, "$5" usado)"}')${R}"; done
+fi
+
+SCORE_FERR=0; declare -a SINAIS=()
+[ "$MULTI_TENANT" = "1" ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#OCI_PROF[@]} profiles OCI de tenancies distintas no mesmo host"); }
+case "$HOSTN" in *bastion*|*jump*|*wise*|*monitor*|*zabbix*|*relatorio*|*mgmt*|*deploy*)
+  SCORE_FERR=$((SCORE_FERR+2)); SINAIS+=("hostname sugere infraestrutura de gestao: $HOSTN");; esac
+if [ ${#OCI_PROF[@]} -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ]; then
+  SCORE_FERR=$((SCORE_FERR+1)); SINAIS+=("tem OCI CLI mas nenhum SGBD de producao local")
+fi
+
+#===============================================================================
+# FASE 2 - PAPEL DO HOST (blindagem principal)
+#===============================================================================
+titulo "FASE 2 - PAPEL DESTE SERVIDOR"
+if [ ${#SINAIS[@]} -gt 0 ]; then
+  say "  ${AMAR}${NEG}ATENCAO${R} sinais de que este host pode ser FERRAMENTA da WiseDB:"
+  for s in "${SINAIS[@]}"; do info "  - $s"; done
+fi
+info "A resposta abaixo decide o que entra na politica do cliente."
+menu_sel single "Qual o papel deste servidor?" \
+ "${NEG}HOST DO CLIENTE${R} - servidor do cliente. Dados locais entram na politica." \
+ "${NEG}ESTACAO DE COLETA / BASTION WiseDB${R} - multi-cliente. Dados locais NAO entram; so a cloud do cliente." \
+ "${NEG}HOST MISTO${R} - do cliente, mas com credenciais de terceiros. Coleta local + tenancy validada."
+PAPEL_IDX=${MENU_SEL[0]:-0}
+[ "$INTER" = "0" ] && [ "$SCORE_FERR" -ge 3 ] && PAPEL_IDX=1
+case "$PAPEL_IDX" in
+  0) PAPEL="HOST_DO_CLIENTE"; COLETA_LOCAL=1;;
+  1) PAPEL="ESTACAO_COLETA_WISEDB"; COLETA_LOCAL=0;;
+  *) PAPEL="HOST_MISTO"; COLETA_LOCAL=1;;
+esac
+ok "Papel: ${NEG}$PAPEL${R}"
+[ "$COLETA_LOCAL" = "0" ] && warn "Coleta LOCAL desabilitada: cron, discos e bases deste host nao serao tratados como do cliente"
+[ "$PAPEL" = "HOST_DO_CLIENTE" ] && [ "$MULTI_TENANT" = "1" ] && \
+  warn "Host declarado do cliente, porem ha ${#OCI_PROF[@]} tenancies configuradas aqui. Revise o config OCI."
+
+#===============================================================================
+# FASE 3 - CLIENTE
+#===============================================================================
+titulo "FASE 3 - IDENTIFICACAO DO CLIENTE"
+pergunta "Nome do cliente (como aparece nos documentos)" CLIENTE ""
+while [ -z "$CLIENTE" ] || echo "$CLIENTE" | grep -qiE '^(teste|test|xxx|abc|a|123)$'; do
+  [ "$INTER" = "0" ] && { CLIENTE="NAO_INFORMADO"; break; }
+  warn "Nome invalido ou de teste. Ele vai para a politica e para o nome do pacote."
+  pergunta "Nome do cliente" CLIENTE ""
+done
+CLI_NORM=$(echo "$CLIENTE" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
+CLI_SLUG=$(echo "$CLI_NORM" | cut -c1-6)
+# Match bidirecional: cobre "DBS Partner" x profile "DBS" e "Interne..." x "INTERNE"
+casa_cliente(){ # casa_cliente "texto"
+  local t; t=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
+  [ -z "$t" ] && return 1
+  [ ${#t} -lt 3 ] && return 1
+  case "$t" in *"$CLI_SLUG"*) return 0;; esac
+  case "$CLI_NORM" in *"$t"*) return 0;; esac
+  return 1
 }
+COERENTE=0
+for t in "$HOSTN" "$FQDN" "$VM_NOME_OCI"; do
+  casa_cliente "$t" && { COERENTE=1; ok "Nome do cliente compativel com '$t'"; break; }
+done
+if [ "$COERENTE" = "0" ] && [ ${#OCI_PROF[@]} -gt 0 ]; then
+  for p in "${OCI_PROF[@]}"; do
+    casa_cliente "$p" && { COERENTE=1; ok "Nome do cliente compativel com o profile '$p'"; break; }
+  done
+fi
+[ "$COERENTE" = "0" ] && warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
+pergunta "RPO acordado (ENTER se nao definido)" RPO "A combinar com o cliente"
+pergunta "RTO acordado (ENTER se nao definido)" RTO "A combinar com o cliente"
+
+#===============================================================================
+# FASE 4 - ESCOPO
+#===============================================================================
+titulo "FASE 4 - ESCOPO DA COLETA"
+declare -a ORA_SEL=() DIR_SEL=()
+if [ "$COLETA_LOCAL" = "1" ] && [ ${#ORA_SIDS[@]} -gt 0 ]; then
+  disp=(); for s in "${ORA_SIDS[@]}"; do disp+=("${NEG}${s%%|*}${R}  ${DIM}${s##*|}${R}"); done
+  menu_sel multi "Instancias Oracle a INCLUIR (ESPACO marca, 'a' = todas)" "${disp[@]}"
+  if [ ${#MENU_SEL[@]} -eq 0 ]; then
+    warn "Nenhuma marcada: todas serao coletadas"
+    for s in "${ORA_SIDS[@]}"; do ORA_SEL+=("${s%%|*}"); done
+  else
+    for i in "${MENU_SEL[@]}"; do ORA_SEL+=("${ORA_SIDS[i]%%|*}"); done
+  fi
+  ok "Oracle no escopo: ${ORA_SEL[*]}"
+fi
+if [ "$COLETA_LOCAL" = "1" ] && [ ${#DIR_CAND[@]} -gt 0 ]; then
+  menu_sel multi "Diretorios de backup a inventariar ('a' = todos)" "${DIR_CAND[@]}"
+  if [ ${#MENU_SEL[@]} -eq 0 ]; then DIR_SEL=("${DIR_CAND[@]}")
+  else for i in "${MENU_SEL[@]}"; do DIR_SEL+=("${DIR_CAND[i]}"); done; fi
+fi
+
+OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""
+if [ ${#OCI_PROF[@]} -gt 0 ]; then
+  disp=()
+  for i in "${!OCI_PROF[@]}"; do
+    mark=""
+    casa_cliente "${OCI_PROF[i]}" && mark="  ${VERD}<= parece ser deste cliente${R}"
+    [ -n "$VM_TENANCY" ] && [ "${OCI_TEN[i]}" = "$VM_TENANCY" ] && mark="$mark  ${MAR}<= mesma tenancy desta VM${R}"
+    disp+=("${NEG}${OCI_PROF[i]}${R}  ${DIM}${OCI_REG[i]:-regiao?} | ...${OCI_TEN[i]: -12}${R}$mark")
+  done
+  disp+=("${VERM}NAO coletar OCI nesta execucao${R}")
+  menu_sel single "Profile OCI do cliente '$CLIENTE' (ha ${#OCI_PROF[@]} tenancies neste host)" "${disp[@]}"
+  sel=${MENU_SEL[0]:-999}
+  if [ "$sel" -lt ${#OCI_PROF[@]} ]; then
+    OCI_SEL_PROF="${OCI_PROF[sel]}"; OCI_SEL_TEN="${OCI_TEN[sel]}"; OCI_SEL_REG="${OCI_REG[sel]}"
+    ok "Profile: ${NEG}$OCI_SEL_PROF${R} | regiao ${OCI_SEL_REG:-padrao}"
+    if [ -n "$VM_TENANCY" ] && [ -n "$OCI_SEL_TEN" ] && [ "$VM_TENANCY" != "$OCI_SEL_TEN" ] && [ "$PAPEL" = "HOST_DO_CLIENTE" ]; then
+      warn "DIVERGENCIA: esta VM esta na tenancy ...${VM_TENANCY: -12} e o profile aponta para ...${OCI_SEL_TEN: -12}"
+      pergunta "Confirma que o profile e do cliente '$CLIENTE'? (s/N)" CONF "N"
+      [ "${CONF^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada por divergencia de tenancy"; }
+    fi
+    if [ -n "$OCI_SEL_PROF" ] && ! casa_cliente "$OCI_SEL_PROF"; then
+      warn "O profile '$OCI_SEL_PROF' nao lembra o nome '$CLIENTE'"
+      pergunta "Prosseguir com este profile? (s/N)" CONF2 "N"
+      [ "${CONF2^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada pelo operador"; }
+    fi
+    if [ -n "$OCI_SEL_PROF" ]; then
+      if oci --profile "$OCI_SEL_PROF" os ns get >/dev/null 2>&1 || oci --profile "$OCI_SEL_PROF" iam region list >/dev/null 2>&1; then
+        ok "Autenticacao do profile validada"
+      else
+        warn "Profile '$OCI_SEL_PROF' nao autenticou (chave/permissao): a coleta OCI pode vir vazia"
+      fi
+    fi
+  else
+    info "Coleta OCI nao sera executada"
+  fi
+elif [ "$NA_OCI" = "1" ]; then
+  warn "Maquina na OCI sem OCI CLI local: rode a coleta OCI no bastion com o profile do cliente"
+fi
+
+SQL_USER=""
+[ "$COLETA_LOCAL" = "1" ] && [ "$SQL_ON" = "1" ] && \
+  pergunta "Usuario de LEITURA do SQL Server (senha pedida na hora, nao e salva)" SQL_USER ""
+
+declare -a EXCL=()
+if [ "$INTER" = "1" ]; then
+  while :; do
+    pergunta "Ambiente/base FORA do escopo da politica (nome, ENTER p/ seguir)" IT ""
+    [ -z "$IT" ] && break
+    pergunta "  Justificativa para '$IT'" JU "Nao informado"
+    EXCL+=("$IT|$JU")
+  done
+fi
+
+#===============================================================================
+# FASE 5 - CONFIRMACAO
+#===============================================================================
+titulo "FASE 5 - CONFIRMACAO DO PLANO"
+say "  Cliente ...........: ${NEG}$CLIENTE${R}"
+say "  Papel do host .....: ${NEG}$PAPEL${R}"
+say "  Coleta local ......: $([ "$COLETA_LOCAL" = "1" ] && echo "${VERD}SIM${R}" || echo "${VERM}NAO (host de ferramenta)${R}")"
+[ ${#ORA_SEL[@]} -gt 0 ] && say "  Oracle ............: ${ORA_SEL[*]}"
+[ -n "$SQL_USER" ] && say "  SQL Server ........: usuario $SQL_USER"
+[ ${#DIR_SEL[@]} -gt 0 ] && say "  Diretorios ........: ${DIR_SEL[*]}"
+say "  OCI ...............: ${OCI_SEL_PROF:-nao sera coletado}${OCI_SEL_PROF:+ (tenancy ...${OCI_SEL_TEN: -12})}"
+say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
+say "  RPO / RTO .........: $RPO / $RTO"
+if [ ${#ALERTAS[@]} -gt 0 ]; then
+  say "  ${AMAR}Alertas: ${#ALERTAS[@]}${R}"; for a in "${ALERTAS[@]}"; do info "  ! $a"; done
+fi
+pergunta "Executar a coleta com este plano? (S/n)" GO "S"
+[ "${GO^^}" = "N" ] && { erro "Coleta cancelada."; exit 0; }
+
+#===============================================================================
+# FASE 6 - COLETA
+#===============================================================================
+titulo "FASE 6 - COLETA (somente leitura)"
+dl(){ local m="$1"
+  if   [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$TMP/$m"
+  elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$TMP/$m"
+  else curl -fsSL "$BASE_URL/$m" -o "$TMP/$m" || { erro "Falha ao baixar $m"; return 1; }
+       [ -s "$TMP/$m" ] || { erro "$m veio vazio"; return 1; }
+  fi
+  chmod +x "$TMP/$m"; }
 
 cd "$WORK"
-echo
-echo "--- COLETA (somente leitura) -------------------------------------------"
-dl 01_coleta_linux_geral.sh   && bash "$TMP/01_coleta_linux_geral.sh"
-[ "${DET[oracle]}"     = "1" ] && dl 02_coleta_oracle.sh           && bash "$TMP/02_coleta_oracle.sh"
-[ "${DET[sqlserver]}"  = "1" ] && dl 03_coleta_sqlserver_linux.sh  && bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,1433" "$SQL_USER"
-[ "${DET[hypervisor]}" = "1" ] && dl 07_coleta_hypervisor_linux.sh && bash "$TMP/07_coleta_hypervisor_linux.sh"
-if [ "${DET[oci]}" = "1" ] && [ -n "$OCI_TENANCY" ]; then
-  dl 05_coleta_oci.sh && bash "$TMP/05_coleta_oci.sh" --profile "$OCI_PROFILE" ${OCI_REGION:+--region "$OCI_REGION"} --tenancy "$OCI_TENANCY"
+if [ "$COLETA_LOCAL" = "1" ]; then
+  dl 01_coleta_linux_geral.sh && bash "$TMP/01_coleta_linux_geral.sh" "${DIR_SEL[@]}" && ok "Inventario local coletado"
+  [ ${#ORA_SEL[@]} -gt 0 ] && dl 02_coleta_oracle.sh && bash "$TMP/02_coleta_oracle.sh" "${ORA_SEL[@]}" && ok "Oracle coletado"
+  [ -n "$SQL_USER" ] && dl 03_coleta_sqlserver_linux.sh && bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,1433" "$SQL_USER" && ok "SQL Server coletado"
+  [ "$HYP_ON" = "1" ] && dl 07_coleta_hypervisor_linux.sh && bash "$TMP/07_coleta_hypervisor_linux.sh" && ok "Hypervisor coletado"
+  [ "$VEEAM_ON" = "1" ] && { echo "## Veeam Agent Linux"; veeamconfig job list 2>&1; veeamconfig session list 2>&1 | tail -30; } > veeam_agent_linux.txt
+else
+  { echo "## CONTEXTO DA ESTACAO DE COLETA - NAO APLICAVEL A POLITICA DO CLIENTE"
+    echo "## Host: $FQDN | Papel: $PAPEL | Coletado em $(date '+%d/%m/%Y %H:%M')"
+    echo "## Este host e ferramenta da WiseDB. Cron, discos e bases locais NAO pertencem ao cliente."
+    echo; echo "Profiles OCI presentes (apenas nomes, para rastreabilidade):"
+    printf '  - %s\n' "${OCI_PROF[@]}"
+  } > contexto_estacao_NAO_DO_CLIENTE.txt
+  ok "Coleta local suprimida; contexto da estacao registrado em arquivo separado"
 fi
-[ "${DET[veeamagent]}" = "1" ] && { echo "## Veeam Agent Linux"; veeamconfig job list 2>&1; veeamconfig session list 2>&1 | tail -30; } > veeam_agent_linux.txt
-cd - >/dev/null
+if [ -n "$OCI_SEL_PROF" ]; then
+  dl 05_coleta_oci.sh && bash "$TMP/05_coleta_oci.sh" --profile "$OCI_SEL_PROF" \
+     ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" && ok "OCI coletado (tenancy do cliente)"
+fi
+cd "$ORIG_DIR"
 
-#=========================== 4. SANITIZACAO =====================================
+#===============================================================================
+# FASE 7 - SANITIZACAO, CONSOLIDACAO, SAIDA
+#===============================================================================
+titulo "FASE 7 - SANITIZACAO E CONSOLIDACAO"
 find "$WORK" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.json" \) -print0 |
 while IFS= read -r -d '' f; do
   sed -i -E \
@@ -146,69 +426,82 @@ while IFS= read -r -d '' f; do
     -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
     -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' "$f"
 done
+rm -rf "$TMP"
 
-#=========================== 5. CONSOLIDACAO ====================================
-FINAL_TXT="$WORK/resultado_final.txt"
+FINAL="$WORK/resultado_final.txt"
 {
   echo "================================================================"
-  echo " WISEDB - COLETA AUTOMATICA | Cliente: $CLIENTE | Host: $HOSTN"
-  echo " Data da coleta: $(date '+%d/%m/%Y %H:%M %Z') | Script v$VERSAO"
-  echo " RPO informado: $RPO | RTO informado: $RTO"
-  echo " Itens fora do escopo declarados no wizard:"
-  if [ ${#EXCLUIDOS[@]} -eq 0 ]; then echo "   (nenhum)"; else
-    for e in "${EXCLUIDOS[@]}"; do echo "   - ${e%%|*} | Justificativa: ${e##*|}"; done; fi
+  echo " WISEDB - COLETA AUTOMATICA v$VERSAO"
+  echo " Cliente ............: $CLIENTE"
+  echo " Host da coleta .....: $FQDN (papel: $PAPEL)"
+  echo " Coleta local .......: $([ "$COLETA_LOCAL" = "1" ] && echo "SIM - evidencia do cliente" || echo "NAO - host de ferramenta WiseDB")"
+  echo " Instancia OCI local : ${VM_NOME_OCI:-n/a} | tenancy ${VM_TENANCY:-n/a}"
+  echo " Profile OCI usado ..: ${OCI_SEL_PROF:-nenhum} | tenancy ${OCI_SEL_TEN:-n/a} | regiao ${OCI_SEL_REG:-n/a}"
+  echo " Oracle no escopo ...: ${ORA_SEL[*]:-nenhum}"
+  echo " Data da coleta .....: $(date '+%d/%m/%Y %H:%M %Z')"
+  echo " RPO informado ......: $RPO"
+  echo " RTO informado ......: $RTO"
+  echo " Fora do escopo .....:"
+  if [ ${#EXCL[@]} -eq 0 ]; then echo "   (nenhum)"; else
+    for e in "${EXCL[@]}"; do echo "   - ${e%%|*} | Justificativa: ${e##*|}"; done; fi
+  echo " Alertas do wizard ..:"
+  if [ ${#ALERTAS[@]} -eq 0 ]; then echo "   (nenhum)"; else
+    for a in "${ALERTAS[@]}"; do echo "   ! $a"; done; fi
   echo "================================================================"
+  echo
+  echo "NOTA PARA A IA: tratar como evidencia do cliente apenas o conteudo coletado"
+  echo "com papel HOST_DO_CLIENTE ou HOST_MISTO, mais a coleta OCI do profile acima."
+  echo "Arquivos com 'NAO_DO_CLIENTE' no nome sao contexto de ferramenta da WiseDB e"
+  echo "nao devem alimentar a politica do cliente."
   find "$WORK" -type f -name "*.txt" ! -name "resultado_final.txt" | sort | while read -r f; do
     echo; echo "########## ARQUIVO: ${f#$WORK/} ##########"; cat "$f"
   done
-} > "$FINAL_TXT"
+} > "$FINAL"
 
-python3 - "$WORK" <<PYEOF 2>/dev/null || echo "[AVISO] python3 ausente; resultado.json nao gerado (txt permanece completo)"
+python3 - "$WORK" "$CLIENTE" "$PAPEL" "$COLETA_LOCAL" "$OCI_SEL_PROF" "$OCI_SEL_TEN" "$VM_TENANCY" "$RPO" "$RTO" <<'PYEOF' 2>/dev/null || warn "python3 ausente: resultado.json nao gerado (o .txt esta completo)"
 import json, os, sys, datetime
-w = sys.argv[1]
-det = { "linux": ${DET[linux]}, "oracle": ${DET[oracle]}, "sqlserver": ${DET[sqlserver]},
-        "mysql_mariadb": ${DET[mysql]}, "postgresql": ${DET[postgres]},
-        "hypervisor_linux": ${DET[hypervisor]}, "oci_cli": ${DET[oci]}, "veeam_agent": ${DET[veeamagent]} }
-exc = [dict(zip(("item","justificativa"), e.split("|",1))) for e in """${EXCLUIDOS[@]:-}""".split() if "|" in e]
+w, cli, papel, local, prof, ten, vmten, rpo, rto = sys.argv[1:10]
+pend = []
+if rpo.startswith("A combinar"): pend.append("RPO nao definido formalmente")
+if rto.startswith("A combinar"): pend.append("RTO nao definido formalmente")
+if local == "0": pend.append("Host de ferramenta: ambiente local do cliente deve ser coletado no servidor do cliente")
+if not prof: pend.append("Coleta OCI nao executada nesta rodada")
+if vmten and ten and vmten != ten: pend.append("Tenancy da VM difere da do profile: escopo validado manualmente")
 doc = {
-  "schema": "wisedb.coleta.backup/v1",
-  "cliente": "$CLIENTE",
-  "coleta": {"host": "$HOSTN", "data": datetime.datetime.now().isoformat(timespec="minutes"),
-             "script_versao": "$VERSAO", "modo": "automatico"},
-  "deteccao": det,
-  "escopo": {"fora_do_escopo": exc},
-  "rpo_informado": "$RPO", "rto_informado": "$RTO",
-  "evidencias_arquivos": sorted(os.path.relpath(os.path.join(r,f), w)
-      for r,_,fs in os.walk(w) for f in fs if f.endswith((".txt",".log",".json")) and f!="resultado.json"),
-  "pendencias": [p for c,p in [
-      (det["mysql_mariadb"]==1, "MySQL/MariaDB detectado: coletar rotina de dump/binlog"),
-      (det["postgresql"]==1, "PostgreSQL detectado: coletar pg_dump/archive_mode"),
-      ("$RPO"=="A combinar com o cliente", "RPO nao definido formalmente"),
-      ("$RTO"=="A combinar com o cliente", "RTO nao definido formalmente")] if c]
+ "schema": "wisedb.coleta.backup/v2",
+ "cliente": cli,
+ "coleta": {"host": os.uname().nodename, "papel_host": papel,
+            "coleta_local_habilitada": local == "1",
+            "data": datetime.datetime.now().isoformat(timespec="minutes"),
+            "script_versao": "3.0"},
+ "oci": {"profile_usado": prof or None, "tenancy_profile": ten or None,
+         "tenancy_da_vm_local": vmten or None,
+         "tenancy_conferida": bool(prof and ten and (not vmten or vmten == ten))},
+ "escopo": {"rpo_informado": rpo, "rto_informado": rto},
+ "evidencias": sorted(os.path.relpath(os.path.join(r,f), w)
+     for r,_,fs in os.walk(w) for f in fs if f.endswith((".txt",".log",".json")) and f != "resultado.json"),
+ "pendencias": pend,
 }
 open(os.path.join(w,"resultado.json"),"w",encoding="utf-8").write(json.dumps(doc, ensure_ascii=False, indent=2))
 print("resultado.json gerado")
 PYEOF
 
-#=========================== 6. RESUMO + OK =====================================
-echo
-echo "=============================== RESUMO ================================"
-echo " Cliente: $CLIENTE | Host: $HOSTN"
-echo " Arquivos de evidencia: $(find "$WORK" -name '*.txt' | wc -l)"
-echo " Fora do escopo: ${#EXCLUIDOS[@]} item(ns) | RPO: $RPO | RTO: $RTO"
-echo " Verificacao de segredos remanescentes:"
-grep -rniE 'password|passwd|secret|token' "$WORK" 2>/dev/null | grep -v 'REMOVIDO' | head -5 || echo "   nenhum encontrado"
-echo "========================================================================"
-ask "Gerar pacote final? (S/n): " OK "S"
-if [ "${OK^^}" != "N" ]; then
-  PACOTE="wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}.tar.gz"
-  tar -czf "$PACOTE" "$WORK"
-  echo
-  echo "PRONTO."
-  echo "  1) Pacote completo : $PACOTE"
-  echo "  2) Para a IA       : $FINAL_TXT (+ resultado.json)"
-  echo "  Cole o conteudo na IA junto com o Modelo_Politica_de_Backup_WiseDB.md"
-  echo "  e o prompt Backup Policy Engineer para gerar a politica e o PDF."
+titulo "RESUMO FINAL"
+say "  Cliente ...........: ${NEG}$CLIENTE${R}"
+say "  Papel do host .....: $PAPEL"
+say "  Arquivos coletados : $(find "$WORK" -name '*.txt' | wc -l)"
+say "  Alertas ...........: ${#ALERTAS[@]}"
+info "Segredos remanescentes:"
+grep -rniE 'password|passwd|secret|token' "$WORK" 2>/dev/null | grep -v 'REMOVIDO' | head -5 || info "  nenhum"
+pergunta "Gerar pacote final? (S/n)" OKF "S"
+if [ "${OKF^^}" != "N" ]; then
+  PAC="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}.tar.gz"
+  tar -czf "$PAC" -C "$ORIG_DIR" "$(basename "$WORK")"
+  say ""
+  say "  ${VERD}${NEG}PRONTO${R}"
+  say "  Pacote ....: $PAC"
+  say "  Para a IA .: $FINAL"
+  say "  Ver com ...: ${DIM}cat \"$FINAL\"${R}"
 else
-  echo "Pacote nao gerado. Os arquivos permanecem em $WORK para revisao."
+  info "Pacote nao gerado. Arquivos em $WORK"
 fi
