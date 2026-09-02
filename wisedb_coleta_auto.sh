@@ -24,7 +24,8 @@ BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit
 VERSAO="2.0"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 DATA=$(date +%Y%m%d)
-WORK="./wisedb_coleta_${HOSTN}_${DATA}"
+ORIG_DIR="$(pwd)"
+WORK="$ORIG_DIR/wisedb_coleta_${HOSTN}_${DATA}"
 TMP="$WORK/.modulos"
 mkdir -p "$TMP"
 
@@ -40,6 +41,13 @@ ask(){ local msg="$1"; local var="$2"; local pad="${3:-}"
 echo "==============================================================="
 echo " WiseDB - Coleta Automatica de Backup v$VERSAO | $HOSTN | $(date '+%d/%m/%Y %H:%M')"
 echo "==============================================================="
+
+# Teste de conectividade com a origem dos modulos (evita falhas silenciosas depois)
+if ! curl -fsSL "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null 2>/dev/null; then
+  echo "[AVISO] Nao foi possivel baixar de: $BASE_URL"
+  echo "        Verifique se WISEDB_BASE_URL aponta para a pasta correta (com ou sem /kit_coleta_backup)"
+  echo "        e se o servidor tem saida HTTPS para raw.githubusercontent.com."
+fi
 
 #=========================== 1. DETECCAO ========================================
 declare -A DET DESC
@@ -108,9 +116,11 @@ fi
 #=========================== 3. MODULOS + COLETA ================================
 dl(){ # baixa modulo do repo; se existir localmente ao lado, usa o local
   local m="$1"
-  if [ -f "./kit_coleta_backup/$m" ]; then cp "./kit_coleta_backup/$m" "$TMP/$m"
-  elif [ -f "./$m" ]; then cp "./$m" "$TMP/$m"
-  else curl -fsSL "$BASE_URL/$m" -o "$TMP/$m" || { echo "[ERRO] Falha ao baixar $m de $BASE_URL"; return 1; }
+  if [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$TMP/$m"
+  elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$TMP/$m"
+  else
+    curl -fsSL "$BASE_URL/$m" -o "$TMP/$m" || { echo "[ERRO] Falha ao baixar $m de $BASE_URL"; return 1; }
+    if [ ! -s "$TMP/$m" ]; then echo "[ERRO] $m baixado vazio (verifique BASE_URL)"; return 1; fi
   fi
   chmod +x "$TMP/$m"
 }
