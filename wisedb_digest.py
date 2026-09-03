@@ -78,21 +78,49 @@ def tem_evidencia(d):
             os.path.isdir(os.path.join(d, "04_windows")))
 
 
-def resolve_base(r):
+def bases_com_evidencia(r):
+    """Todas as pastas de evidencia sob a raiz, nao apenas a primeira.
+
+    A versao anterior retornava UMA pasta. Quando a pasta de trabalho continha
+    a coleta de mais de um host, por exemplo coleta_bastion-database_* e
+    coleta_databaseprod_*, o digest descrevia apenas a que vinha primeiro em
+    ordem alfabetica e o RESUMO do outro host saia sem nenhuma secao de
+    evidencia, dando a impressao de host sem backup. Agora enumeramos todas e
+    avisamos quando ha mais de uma.
+    """
+    achadas = []
     if tem_evidencia(r):
-        return r
-    cand = [d for d in sorted(glob.glob(os.path.join(r, "coleta_*")))
-            if os.path.isdir(d) and not os.path.basename(d).startswith("coleta_oci_")]
-    for d in cand:
-        if tem_evidencia(d):
+        achadas.append(r)
+    for d in sorted(glob.glob(os.path.join(r, "coleta_*"))):
+        if (os.path.isdir(d) and not os.path.basename(d).startswith("coleta_oci_")
+                and tem_evidencia(d) and d not in achadas):
+            achadas.append(d)
+    if not achadas:
+        for atual, dirs, _ in os.walk(r):
+            if any(x in dirs for x in ("01_linux", "02_oracle", "03_sqlserver", "04_windows")):
+                achadas.append(atual)
+    return achadas
+
+
+BASES = bases_com_evidencia(raiz)
+host_local = os.uname().nodename.split(".")[0]
+
+
+def escolhe_base(cands):
+    """Prioriza a pasta do host onde o digest esta rodando.
+
+    Sem isso, com duas coletas na mesma pasta, o RESUMO podia descrever o
+    ambiente de um host e levar o nome de outro no cabecalho.
+    """
+    if not cands:
+        return raiz
+    for d in cands:
+        if host_local and host_local in os.path.basename(d):
             return d
-    for atual, dirs, _ in os.walk(r):
-        if any(x in dirs for x in ("01_linux", "02_oracle", "03_sqlserver", "04_windows")):
-            return atual
-    return cand[-1] if cand else r
+    return cands[0]
 
 
-base = resolve_base(raiz)
+base = escolhe_base(BASES)
 
 
 def ler_ev(rel):
@@ -188,9 +216,82 @@ if papel == "ESTACAO_COLETA_WISEDB":
     add("# NOTA: host de ferramenta WiseDB. Dados locais NAO pertencem ao cliente;")
     add("#       somente a coleta OCI abaixo e evidencia do cliente.")
 
-if not tem_evidencia(base) and not glob_ev("coleta_oci_*"):
+def oci_dirs_recursivo(r):
+    """Procura coleta_oci_* em qualquer nivel.
+
+    A busca antiga olhava apenas a raiz e a base, e emitia "coleta OCI ausente
+    neste pacote" mesmo quando a coleta existia num nivel abaixo. Esse falso
+    positivo levava a politica a registrar pendencia inexistente.
+    """
+    achados = []
+    for d in glob_ev("coleta_oci_*"):
+        if os.path.isdir(d):
+            achados.append(d)
+    for atual, dirs, _ in os.walk(r):
+        for d in dirs:
+            if d.startswith("coleta_oci_"):
+                p = os.path.join(atual, d)
+                if p not in achados:
+                    achados.append(p)
+    return sorted(set(achados))
+
+
+OCI_DIRS = oci_dirs_recursivo(raiz)
+
+# Profiles distintos no mesmo pacote significam evidencia de mais de um cliente.
+# Nesse caso NAO renderizamos nenhum dado OCI: exibir a coleta de um profile
+# escolhido por ordem alfabetica foi exatamente o que fez o ambiente de um
+# cliente aparecer no resumo de outro.
+OCI_PERFIS = sorted({os.path.basename(d).replace("coleta_oci_", "").rsplit("_", 1)[0]
+                     for d in OCI_DIRS})
+OCI_CONTAMINADO = len(OCI_PERFIS) > 1
+
+
+def glob_todas_bases(padrao):
+    """Varre o padrao em TODAS as bases de evidencia, nao apenas na escolhida.
+
+    Blocos como destino do SBT e dbcli nao podem se perder so porque o pacote
+    tem mais de um host: eles descrevem o backup fisico, o dado mais critico.
+    """
+    vistos, out = set(), []
+    for d in list(BASES) + [raiz]:
+        for p in sorted(glob.glob(os.path.join(d, padrao))):
+            k = os.path.realpath(p)
+            if k not in vistos:
+                vistos.add(k)
+                out.append(p)
+    return out
+
+
+def ler_todas_bases(rel):
+    for d in list(BASES) + [raiz]:
+        t = ler(os.path.join(d, rel))
+        if t:
+            return t
+    return ""
+
+if not tem_evidencia(base) and not OCI_DIRS:
     ALERTAS.append("DIGEST: nao localizei 01_linux/02_oracle/03_sqlserver nem coleta_oci_* "
                    "em " + os.path.basename(raiz) + " -> RESUMO incompleto, use o resultado_final.txt")
+
+# Pacote com mais de um host: o RESUMO descreve so um deles, e o operador precisa
+# saber quais ficaram de fora para nao concluir que aquele host nao tem backup.
+if len(BASES) > 1:
+    outras = [os.path.basename(d) for d in BASES if d != base]
+    ALERTAS.append("DIGEST: este pacote contem coleta de mais de um host. Este RESUMO descreve "
+                   + os.path.basename(base) + ". Nao descrito(s) aqui: " + ", ".join(outras)
+                   + " -> gere um RESUMO por host ou use o resultado_final.txt")
+
+# Contaminacao entre clientes: mais de uma tenancy no mesmo pacote. Nunca deve
+# alimentar a politica, porque parte da evidencia pertence a outro cliente.
+if len(OCI_DIRS) > 1:
+    perfis = sorted({os.path.basename(d).replace("coleta_oci_", "").rsplit("_", 1)[0]
+                     for d in OCI_DIRS})
+    if len(perfis) > 1:
+        ALERTAS.append("INCONSISTENCIA DE COLETA: o pacote traz coletas OCI de profiles "
+                       "diferentes (" + ", ".join(perfis) + "). Isso indica reuso de pasta de "
+                       "trabalho entre clientes. NAO use este pacote para gerar politica: "
+                       "identifique o profile do cliente correto e recolete em pasta limpa")
 
 # ============================ 1. SERVIDOR ===================================
 inv = ler_ev(os.path.join("01_linux", "inventario_geral.txt"))
@@ -403,9 +504,66 @@ if sqlsrv:
         if re.search(r'\w', seg.replace("FULL", "").replace("EM 15 DIAS", "").replace("#", "")):
             ALERTAS.append("Ha bases SQL Server sem FULL nos ultimos 15 dias (ver secao)")
 
+# --- Destino real do SBT e agendador do backup fisico ----------------------
+# Estes dois blocos existem porque "destino a confirmar" e "agendador inferido"
+# eram as duas lacunas mais frequentes na politica do backup fisico.
+for dst in sorted(glob_todas_bases(os.path.join("02_oracle", "*_destino_sbt.txt"))):
+    t = ler(dst)
+    if not t.strip():
+        continue
+    sid = os.path.basename(dst).replace("_destino_sbt.txt", "")
+    sec("DESTINO DO BACKUP FISICO: " + sid)
+    m = re.search(r'SBT_LIBRARY:\s*(\S+)', t)
+    if m:
+        add("  Biblioteca SBT: " + m.group(1))
+    m = re.search(r'Tipo de destino \(inferido\):\s*(.+)', t)
+    if m:
+        add("  Tipo de destino: " + m.group(1).strip())
+    m = re.search(r'OPC_CONTAINER\s*=\s*(\S+)', t)
+    if m:
+        add("  Bucket de destino (OPC_CONTAINER): " + m.group(1))
+    else:
+        m = re.search(r'OPC_HOST\s*=\s*(\S+)', t)
+        if m:
+            add("  OPC_HOST: " + m.group(1) + " | OPC_CONTAINER nao presente no pfile")
+        elif "Nenhum OPC_PFILE declarado" in t:
+            add("  Sem OPC_PFILE: destino provavelmente Recovery Service via wallet SEPS")
+        elif "sem permissao de leitura" in t:
+            ALERTAS.append(sid + ": OPC_PFILE existe mas nao pudemos ler -> bucket de destino do "
+                                 "backup fisico permanece NAO IDENTIFICADO; reexecutar com WISEDB_SUDO=1")
+    if "Nenhum SBT_LIBRARY declarado" in t:
+        ALERTAS.append(sid + ": nenhum destino SBT declarado no RMAN -> backup fisico apenas em DISK")
+
+dbc = ler_todas_bases(os.path.join("02_oracle", "dbcli_backupconfig.txt"))
+if dbc.strip():
+    sec("AGENDADOR DO BACKUP FISICO (dbcli)")
+    if "[PENDENTE]" in dbc:
+        add("  dbcli presente no host, porem sem privilegio para consultar.")
+        ALERTAS.append("Agendador do backup fisico nao comprovado: dbcli exige root. "
+                       "Reexecutar com WISEDB_SUDO=1, senao o agendador fica como INFERIDO")
+    else:
+        for ln in dbc.splitlines():
+            s = ln.rstrip()
+            if re.search(r'(RECOVERY_WINDOW|recoveryWindow|Backup\s*Config|destination|Objectstore|'
+                         r'ObjectStore|DISK|NONE|crontab|Schedule|scheduleName|cronExpression)', s, re.I):
+                if s.strip() and not s.startswith("####"):
+                    add("  " + s.strip()[:110])
+        add("  (detalhe completo em 02_oracle/dbcli_backupconfig.txt)")
+
+# --- Nivel de privilegio da coleta -----------------------------------------
+priv = ler_todas_bases("nivel_privilegio_coleta.txt") or ler(os.path.join(raiz, "nivel_privilegio_coleta.txt"))
+if priv.strip() and "sudo usado .: NAO" in priv:
+    ALERTAS.append("Coleta executada sem sudo: /etc/crontab, /etc/cron.d e dbcli nao auditados -> "
+                   "pode existir job de backup sob root fora desta evidencia")
+
 # ============================ 4. OCI ========================================
-oci_dirs = glob_ev("coleta_oci_*")
-if oci_dirs:
+oci_dirs = OCI_DIRS
+if OCI_CONTAMINADO:
+    sec("OCI - SECAO SUPRIMIDA")
+    add("  Ha coletas OCI de mais de um profile neste pacote (" + ", ".join(OCI_PERFIS) + ").")
+    add("  Parte da evidencia pertence a outro cliente, portanto nenhum dado de nuvem e")
+    add("  exibido aqui. Recolete em pasta limpa antes de gerar a politica.")
+elif oci_dirs:
     od = oci_dirs[0]
     sec("OCI - " + os.path.basename(od))
 
@@ -530,6 +688,71 @@ if oci_dirs:
     t = ler(os.path.join(od, "42_autonomous.txt"))
     if re.search(r'\|\s*AVAILABLE\s*\|', t):
         add("  Autonomous Databases: presentes (ver pacote para retencao)")
+
+    # Backup config dos DB Systems: separa "sem backup gerenciado" de "backup
+    # feito por RMAN proprio", leitura que antes ficava ambigua.
+    t = ler(os.path.join(od, "43_db_backup_config.txt"))
+    if t.strip():
+        pares = re.findall(r'"nome":\s*"([^"]+)"[\s\S]{0,400}?"auto":\s*(true|false|null)'
+                           r'[\s\S]{0,200}?"retencao_dias":\s*(\d+|null)', t)
+        if pares:
+            add("  Backup automatico gerenciado dos DB Systems:")
+            for nome, auto, dias in pares[:12]:
+                estado = {"true": "habilitado", "false": "DESABILITADO", "null": "nao informado"}[auto]
+                add("    " + nome + ": " + estado +
+                    (", retencao " + dias + " dias" if dias != "null" else ""))
+                if auto == "false":
+                    ALERTAS.append("DB System " + nome + ": backup automatico gerenciado da OCI "
+                                   "DESABILITADO -> a protecao depende inteiramente do RMAN proprio, "
+                                   "confirmar destino e retencao no SHOW ALL")
+
+    # Recovery Service: quando o RMAN esta com RETENTION POLICY TO NONE, a
+    # janela real de recuperacao vive aqui e nao no banco.
+    t = ler(os.path.join(od, "45_recovery_service.txt"))
+    if t.strip():
+        protegidos = re.findall(r'"nome":\s*"([^"]+)"[\s\S]{0,300}?"saude":\s*"([^"]+)"', t)
+        if protegidos:
+            add("  Recovery Service, bancos protegidos:")
+            for nome, saude in protegidos[:10]:
+                add("    " + nome + ": saude " + saude)
+                if saude.upper() not in ("PROTECTED", "HEALTHY"):
+                    ALERTAS.append("Recovery Service: banco " + nome + " com saude " + saude +
+                                   " -> protecao degradada")
+        m = re.findall(r'"dias":\s*(\d+)', t)
+        if m:
+            add("  Recovery Service, retencao das politicas (dias): " + ", ".join(sorted(set(m))))
+        elif protegidos:
+            ALERTAS.append("Recovery Service em uso, porem a retencao da protection policy nao foi "
+                           "retornada -> janela de recuperacao do backup fisico permanece A CONFIRMAR")
+
+    # Cross-region: unico teste objetivo do criterio offsite do 3-2-1-1-0.
+    t = ler(os.path.join(od, "50_cross_region.txt"))
+    if t.strip():
+        regioes = re.findall(r'\|\s*([a-z]{2}-[a-z]+-\d)\s*\|', t)
+        copias = re.findall(r'ocid1\.(?:volumebackup|bootvolumebackup)\.', t)
+        if regioes:
+            add("  Regioes assinadas pela tenancy: " + ", ".join(sorted(set(regioes))))
+        if copias:
+            add("  Copias de volume recebidas de outra regiao: " + str(len(copias)))
+        else:
+            add("  Nenhuma copia cross-region de volume identificada nesta regiao")
+            ALERTAS.append("Nenhuma copia cross-region identificada: o criterio '1 copia offsite' do "
+                           "3-2-1-1-0 esta atendido apenas no sentido de estar fora do servidor, nao "
+                           "fora da regiao. Evento regional afeta producao e backup ao mesmo tempo")
+
+    # Replicacao de bucket: offsite do backup logico.
+    reps = sorted(glob.glob(os.path.join(od, "31_bucket_*_replicacao.txt")))
+    if reps:
+        com_rep = []
+        for rp in reps:
+            c = ler(rp)
+            nome = os.path.basename(rp).replace("31_bucket_", "").replace("_replicacao.txt", "")
+            if '"id"' in c or '"destination-region"' in c:
+                com_rep.append(nome)
+        if com_rep:
+            add("  Buckets com replicacao ativa: " + ", ".join(com_rep))
+        else:
+            add("  Nenhum bucket com politica de replicacao: dumps existem em uma unica regiao")
 else:
     ALERTAS.append("Coleta OCI ausente neste pacote: retencao real na nuvem, imutabilidade de bucket, "
                    "politica de boot/block volume e snapshots de FSS nao foram evidenciados")

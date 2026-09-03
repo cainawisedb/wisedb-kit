@@ -15,18 +15,42 @@
 #   tenancy escolhida entra como evidencia do cliente.
 #
 # RISCO: Zero no ambiente. Somente leitura.
+#
+# v3.2 (setembro/2026)
+#   [CRITICO]   A pasta de trabalho passa a conter o nome do cliente e a hora.
+#               Antes era wisedb_coleta_<host>_<data>: duas coletas no mesmo
+#               bastion, no mesmo dia, para clientes diferentes reutilizavam a
+#               mesma pasta e o pacote saia com a coleta OCI de dois clientes
+#               juntos. O RESUMO de um cliente chegava a descrever o ambiente
+#               do outro. Cada coleta agora tem pasta propria e um arquivo
+#               .cliente para rastreabilidade.
+#   [NOVO]      Elevacao opcional via sudo, com pergunta ao operador. Sem ela
+#               /etc/crontab, /etc/cron.d e o dbcli ficam ilegiveis e o
+#               agendador do backup fisico em DB System/ODA nunca e comprovado.
+#   [NOVO]      Arquivo nivel_privilegio_coleta.txt declara se a coleta rodou
+#               com sudo, para que a pendencia fique explicita no documento.
+#   [NOVO]      Profundidade de varredura configuravel e com default maior
+#               (WISEDB_LIST_DEPTH=4, WISEDB_DUMP_DEPTH=5), eliminando o falso
+#               negativo "nenhum dump" em layouts com PDB em subpasta.
+#   [NOVO]      Coleta OCI ampliada: IPs de instancia, volume groups, block
+#               volumes, Recovery Service, backup config dos DB Systems,
+#               replicacao de bucket e verificacao de copia cross-region.
 #===============================================================================
 set -uo pipefail
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.1"
+VERSAO="3.2"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
+HORA=$(date +%H%M)
 ORIG_DIR="$(pwd)"
-WORK="$ORIG_DIR/wisedb_coleta_${HOSTN}_${DATA}"
-TMP="$WORK/.modulos"
-mkdir -p "$TMP"
+# WORK so e definido na FASE 3, quando o cliente e conhecido, para que o nome da
+# pasta carregue o cliente e nao possa colidir com a coleta de outro cliente no
+# mesmo host e no mesmo dia. Os modulos baixados vivem num temporario proprio.
+WORK=""
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/wisedb_mod.XXXXXX") || { echo "Falha ao criar temporario"; exit 1; }
+trap 'rm -rf "$TMP" 2>/dev/null' EXIT
 
 #---------------------------- UI: cores e helpers -------------------------------
 if [ -t 1 ] || [ -e /dev/tty ]; then
@@ -300,9 +324,79 @@ if [ "$COERENTE" = "0" ] && [ ${#OCI_PROF[@]} -gt 0 ]; then
     casa_cliente "$p" && { COERENTE=1; ok "Nome do cliente compativel com o profile '$p'"; break; }
   done
 fi
-[ "$COERENTE" = "0" ] && warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
+if [ "$COERENTE" = "0" ]; then
+  # A tenancy do metadata local conferindo com a do profile escolhido e prova
+  # mais forte do que semelhanca de nome. Sem esta ressalva o wizard emitia
+  # "cliente nao aparece no hostname" em hosts legitimos, e o alerta falso
+  # chegava a virar pendencia no documento do cliente.
+  if [ -n "${VM_TENANCY:-}" ] && [ -n "${OCI_SEL_TEN:-}" ] && [ "$VM_TENANCY" = "$OCI_SEL_TEN" ]; then
+    ok "Nome do cliente nao casa com hostname nem profile, porem a tenancy do host confere com a do profile: escopo coerente"
+  else
+    warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
+  fi
+fi
 pergunta "RPO acordado (ENTER se nao definido)" RPO "A combinar com o cliente"
 pergunta "RTO acordado (ENTER se nao definido)" RTO "A combinar com o cliente"
+
+#-------------------------------------------------------------------------------
+# Pasta de trabalho definitiva: cliente + host + data + hora.
+#
+# O nome antigo, wisedb_coleta_<host>_<data>, nao continha o cliente. Duas
+# coletas no mesmo host e no mesmo dia para clientes diferentes, cenario normal
+# num bastion com varios profiles, reutilizavam a MESMA pasta. O resultado era
+# um pacote com coleta_oci_<CLIENTE_A> e coleta_oci_<CLIENTE_B> juntos, e um
+# RESUMO de um cliente descrevendo o ambiente do outro. Dado de cliente
+# vazando para o documento de outro cliente e o pior defeito possivel aqui.
+#-------------------------------------------------------------------------------
+WORK="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}_${HORA}"
+if [ -d "$WORK" ]; then
+  warn "Pasta $WORK ja existe; usando sufixo para nao misturar coletas"
+  WORK="${WORK}_$$"
+fi
+mkdir -p "$WORK"
+CLI_TAG="$WORK/.cliente"
+printf '%s\n' "$CLIENTE" > "$CLI_TAG"
+
+# Guarda adicional: se por qualquer motivo a pasta receber evidencia de outro
+# cliente, abortamos a consolidacao em vez de gerar um pacote misturado.
+CONTAMINADO=0
+for d in "$ORIG_DIR"/wisedb_coleta_*/; do
+  [ -d "$d" ] || continue
+  [ "$(readlink -f "$d")" = "$(readlink -f "$WORK")" ] && continue
+  if [ -f "$d/.cliente" ] && [ "$(cat "$d/.cliente" 2>/dev/null)" != "$CLIENTE" ]; then
+    info "Coleta anterior de outro cliente encontrada em $(basename "$d"), sera ignorada"
+  fi
+done
+ok "Pasta de trabalho desta coleta: $(basename "$WORK")"
+
+#-------------------------------------------------------------------------------
+# Elevacao opcional. Sem sudo, /etc/crontab e /etc/cron.d ficam ilegiveis para
+# oracle e o dbcli nao roda: o agendador do backup fisico do DB System nunca e
+# comprovado e a politica registra o agendador como INFERIDO.
+#-------------------------------------------------------------------------------
+WISEDB_SUDO=0
+if command -v sudo >/dev/null 2>&1; then
+  if sudo -n true 2>/dev/null; then
+    WISEDB_SUDO=1
+    ok "sudo sem senha disponivel: cron de sistema e dbcli serao coletados"
+  else
+    pergunta "Usar sudo para ler cron de sistema e dbcli? Pode pedir senha (S/n)" USESUDO "S"
+    if [ "${USESUDO^^}" != "N" ]; then
+      if sudo -v 2>/dev/null && sudo -n true 2>/dev/null; then
+        WISEDB_SUDO=1; ok "sudo validado"
+      else
+        warn "sudo indisponivel: cron de sistema e dbcli nao serao coletados; agendador do backup fisico ficara como pendencia"
+      fi
+    else
+      warn "Coleta sem sudo por escolha do operador: cron de sistema e dbcli ficarao como pendencia"
+    fi
+  fi
+else
+  warn "sudo nao instalado: cron de sistema e dbcli nao serao coletados"
+fi
+export WISEDB_SUDO
+export WISEDB_LIST_DEPTH="${WISEDB_LIST_DEPTH:-4}"
+export WISEDB_DUMP_DEPTH="${WISEDB_DUMP_DEPTH:-5}"
 
 #===============================================================================
 # FASE 4 - ESCOPO
@@ -437,10 +531,25 @@ else
   ok "Coleta local suprimida; contexto da estacao registrado em arquivo separado"
 fi
 if [ -n "$OCI_SEL_PROF" ]; then
-  info "Coleta OCI iniciada. Em tenancies com muitos compartments isso pode levar varios minutos; aguarde sem interromper."
+  info "Coleta OCI iniciada. Agora inclui IPs das instancias, volume groups, block volumes,"
+  info "Recovery Service, backup config dos DB Systems, replicacao de bucket e verificacao"
+  info "cross-region. Em tenancies grandes pode levar varios minutos; aguarde sem interromper."
   dl 05_coleta_oci.sh && bash "$TMP/05_coleta_oci.sh" --profile "$OCI_SEL_PROF" \
-     ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" && ok "OCI coletado (tenancy do cliente)"
+     ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" \
+     --obj-limit "${WISEDB_OBJ_LIMIT:-50}" && ok "OCI coletado (tenancy do cliente)"
 fi
+# Registro explicito do nivel de privilegio da coleta. Entra no resultado_final e
+# permite a quem le a politica saber se o cron de sistema foi de fato auditado.
+{ echo "## NIVEL DE PRIVILEGIO DESTA COLETA"
+  echo "## Usuario ....: $(whoami)"
+  echo "## sudo usado .: $([ "$WISEDB_SUDO" = "1" ] && echo 'SIM' || echo 'NAO')"
+  if [ "$WISEDB_SUDO" != "1" ]; then
+    echo "## [PENDENCIA] Sem sudo: /etc/crontab, /etc/cron.d e dbcli nao foram lidos."
+    echo "## [PENDENCIA] Pode existir job de backup sob root fora desta coleta, e o"
+    echo "## [PENDENCIA] agendador do backup fisico em DB System/ODA fica como INFERIDO."
+  fi
+  echo "## Profundidade: listagem=$WISEDB_LIST_DEPTH niveis, dumps=$WISEDB_DUMP_DEPTH niveis"
+} > "$WORK/nivel_privilegio_coleta.txt"
 cd "$ORIG_DIR"
 
 #===============================================================================

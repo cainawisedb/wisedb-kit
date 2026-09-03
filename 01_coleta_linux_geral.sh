@@ -27,6 +27,19 @@
 #               avisa quando o cron de sistema esta inacessivel.
 #   [CORRIGIDO] Arquivos de saida truncados no inicio; reexecutar no mesmo dia
 #               nao concatena mais o conteudo anterior.
+#
+# Versao 1.2 (setembro/2026)
+#   [CORRIGIDO] Profundidade da listagem dos diretorios de backup era fixa em 2
+#               niveis. Layouts comuns como /u02/Backup/<SID>/Bkp_Logico/<PDB>
+#               ficavam fora do alcance e o coletor reportava "nenhum dump",
+#               falso negativo. Agora o default e 4 niveis, ajustavel por
+#               WISEDB_LIST_DEPTH.
+#   [NOVO]      Se sudo -n estiver disponivel, o cron de sistema e relido com
+#               privilegio, eliminando o ponto cego de job de backup sob root.
+#               Controlado por WISEDB_SUDO=1 (o wizard exporta automaticamente).
+#   [NOVO]      Registra /etc/oratab e a arvore de configuracao de SBT do DCS
+#               (oss/, dbrs/, wallets/) apenas por nome de arquivo, para
+#               identificar o destino real do RMAN sem expor wallet.
 #===============================================================================
 set -uo pipefail
 
@@ -35,6 +48,15 @@ OUT="./coleta_${HOSTN}_$(date +%Y%m%d)/01_linux"
 mkdir -p "$OUT"
 INV="$OUT/inventario_geral.txt"
 : > "$INV"
+
+# Profundidade da listagem dos diretorios de backup (default 4 niveis).
+LIST_DEPTH="${WISEDB_LIST_DEPTH:-4}"
+
+# sudo nao interativo: usado apenas para releitura do cron de sistema.
+SUDO=""
+if [ "${WISEDB_SUDO:-0}" = "1" ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  SUDO="sudo -n"
+fi
 
 log(){ echo "[$(date +%H:%M:%S)] $*"; }
 run(){ # run "titulo" comando...
@@ -85,18 +107,46 @@ for u in oracle mssql root postgres mysql veeam backup; do
   run "Crontab do usuario $u (se root)" sh -c "crontab -l -u $u 2>/dev/null || echo 'Sem acesso ou usuario inexistente'"
 done
 
+# Releitura privilegiada do cron de sistema quando sudo -n esta disponivel.
+# Sem isso o ponto cego permanece: job de backup sob root nao aparece na coleta.
+if [ -n "$SUDO" ]; then
+  run "Crontab de sistema (/etc/crontab) via sudo" sh -c "$SUDO cat /etc/crontab"
+  run "Jobs em /etc/cron.d via sudo" sh -c "$SUDO ls -lah /etc/cron.d/ && $SUDO grep -rH '' /etc/cron.d/ 2>/dev/null"
+  run "Listagem cron.hourly/daily/weekly/monthly via sudo" \
+    sh -c "$SUDO ls -lah /etc/cron.hourly/ /etc/cron.daily/ /etc/cron.weekly/ /etc/cron.monthly/ 2>/dev/null"
+  for u in root oracle mssql postgres mysql veeam backup opc; do
+    run "Crontab do usuario $u via sudo" \
+      sh -c "$SUDO crontab -l -u $u 2>/dev/null || echo 'Sem crontab para $u'"
+  done
+  log "Cron de sistema relido com sudo"
+fi
+
 # Aviso explicito quando o cron de sistema nao pode ser lido por este usuario
-if grep -qE '/etc/cron[^\n]*(Permission denied)|cannot open directory .?/etc/cron' "$INV" 2>/dev/null; then
+if [ -z "$SUDO" ] && grep -qE '/etc/cron[^\n]*(Permission denied)|cannot open directory .?/etc/cron' "$INV" 2>/dev/null; then
   {
     echo "################################################################"
     echo "## [ATENCAO] Cron de sistema inacessivel para o usuario $(whoami)"
-    echo "## /etc/crontab e/ou /etc/cron.d nao pudaram ser lidos. Pode existir"
-    echo "## job de backup sob root invisivel nesta coleta. Reexecutar com sudo."
+    echo "## /etc/crontab e/ou /etc/cron.d nao puderam ser lidos. Pode existir"
+    echo "## job de backup sob root invisivel nesta coleta. Reexecutar com:"
+    echo "##   WISEDB_SUDO=1 bash 01_coleta_linux_geral.sh"
+    echo "## ou responder S na pergunta de sudo do wizard."
     echo "################################################################"
     echo
   } >> "$INV"
-  log "[ATENCAO] cron de sistema inacessivel; reexecute com sudo para cobertura total"
+  log "[ATENCAO] cron de sistema inacessivel; reexecute com WISEDB_SUDO=1"
 fi
+
+# --- Indicios do destino real do backup do banco (SBT / DCS) -------------------
+# Somente nomes de arquivo e diretorio. Nenhum conteudo de wallet e lido.
+run "Oratab (instancias registradas)" sh -c "cat /etc/oratab 2>/dev/null || echo 'Sem /etc/oratab'"
+run "Configuracao de SBT do DCS (Object Storage, Recovery Service e wallets)" sh -c "
+  for p in /opt/oracle/dcs/commonstore/oss /opt/oracle/dcs/commonstore/dbrs /opt/oracle/dcs/commonstore/wallets; do
+    if [ -d \"\$p\" ]; then
+      echo \"-- \$p\"
+      find \"\$p\" -maxdepth 3 \\( -type f -o -type d \\) -printf '%y %TY-%Tm-%Td %10s  %p\n' 2>/dev/null | sort
+    fi
+  done
+  [ -d /opt/oracle/dcs/commonstore ] || echo 'Host sem /opt/oracle/dcs/commonstore (nao e DB System/ODA)'"
 
 # --- Descoberta e copia (mascarada) dos scripts de backup ---------------------
 # Extrai caminhos de scripts citados nos crontabs, copia o conteudo com
@@ -160,7 +210,10 @@ if [ ${#DIRS[@]} -eq 0 ]; then
 fi
 for d in "${DIRS[@]}"; do
   [ -d "$d" ] || continue
-  run "Listagem recursiva (2 niveis) de $d" sh -c "find '$d' -maxdepth 2 -printf '%TY-%Tm-%Td %TH:%TM %10s  %p\n' 2>/dev/null | sort | tail -400"
+  run "Listagem recursiva ($LIST_DEPTH niveis) de $d" sh -c "timeout 240 find '$d' -maxdepth $LIST_DEPTH -printf '%TY-%Tm-%Td %TH:%TM %10s  %p\n' 2>/dev/null | sort | tail -400"
+  # Recorte dedicado aos artefatos de backup: com muitos arquivos, o tail -400 da
+  # listagem geral pode empurrar os dumps para fora da amostra.
+  run "Artefatos de backup em $d (dump, backupset, tar.gz)" sh -c "timeout 240 find '$d' -maxdepth $LIST_DEPTH -type f \\( -name '*.dmp' -o -name '*.dmp.gz' -o -name '*.dmp.tar.gz' -o -name '*.bkp' -o -name '*.bak' -o -name '*.trn' -o -name '*.tar.gz' \\) -printf '%TY-%Tm-%Td %TH:%TM %10s  %p\n' 2>/dev/null | sort | tail -80 || echo 'Nenhum artefato de backup encontrado'"
   run "Uso de espaco por subpasta de $d" sh -c "timeout 180 du -h --max-depth=2 '$d' 2>/dev/null | sort -k2 | tail -40 || echo '[AVISO] du interrompido por timeout ou sem permissao'"
   run "Snapshots visiveis em $d (indicio de snapshot de FSS/NAS)" sh -c "if [ -d '$d/.snapshot' ]; then ls -1 '$d/.snapshot' | head -20; else echo 'Sem diretorio .snapshot visivel'; fi"
 done
