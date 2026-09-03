@@ -19,7 +19,7 @@
 set -uo pipefail
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.0"
+VERSAO="3.1"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -452,7 +452,8 @@ while IFS= read -r -d '' f; do
   sed -i -E \
     -e 's/((password|passwd|pwd|secret|token|apikey|api_key|client_secret)[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig' \
     -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
-    -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' "$f"
+    -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' \
+    -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"']{3,}@#\1/***REMOVIDO***@#g' "$f"
 done
 TMP_DIGEST="$WORK/.digest"; mkdir -p "$TMP_DIGEST"
 [ -f "$TMP/wisedb_digest.py" ] && cp "$TMP/wisedb_digest.py" "$TMP_DIGEST/" 2>/dev/null
@@ -520,8 +521,13 @@ PYEOF
 # ---- RESUMO COMPACTO (o que voce cola na IA) -------------------------------
 RESUMO="$WORK/RESUMO_${CLIENTE// /_}_${HOSTN}.txt"
 if dl wisedb_digest.py 2>/dev/null; then
-  python3 "$TMP_DIGEST/wisedb_digest.py" "$WORK" "$CLIENTE" "$PAPEL" "$RESUMO" 2>/dev/null \
+  python3 "$TMP_DIGEST/wisedb_digest.py" "$WORK" "$CLIENTE" "$PAPEL" "$RESUMO" \
     || warn "Digest nao gerado; use o resultado_final.txt"
+  # o digest v2.1 resolve sozinho a subpasta coleta_<host>_<data>; se ainda assim
+  # o resumo sair sem secao de evidencia, avisa em vez de entregar resumo vazio
+  if [ -s "$RESUMO" ] && ! grep -qE '^== (SERVIDOR|ORACLE|SQL SERVER|OCI)' "$RESUMO"; then
+    warn "RESUMO sem secoes de evidencia. Verifique $WORK e use o resultado_final.txt"
+  fi
 fi
 
 titulo "RESUMO FINAL"
