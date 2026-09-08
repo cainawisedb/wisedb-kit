@@ -1,11 +1,15 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
-# v3.0 - Wizard blindado (papel do host, multi-tenancy, coerencia de escopo)
+# v3.3 - Wizard blindado (papel do host, multi-tenancy, coerencia de escopo)
 #
 # USO:
 #   export WISEDB_BASE_URL="https://raw.githubusercontent.com/SUAORG/wisedb-kit/main"
 #   bash <(curl -fsSL "$WISEDB_BASE_URL/wisedb_coleta_auto.sh")
+#
+#   Em host legado, a v3.3 tenta TLS normal nos modulos e faz fallback
+#   automatico para -k somente quando o curl retornar erro 60. Para desabilitar:
+#   export WISEDB_SSL_FALLBACK=0
 #
 # PRINCIPIO CRITICO DESTA VERSAO:
 #   Nunca assumir que o servidor onde o script roda pertence ao cliente.
@@ -16,7 +20,7 @@
 #
 # RISCO: Zero no ambiente. Somente leitura.
 #
-# v3.2 (setembro/2026)
+# v3.3 (setembro/2026)
 #   [CRITICO]   A pasta de trabalho passa a conter o nome do cliente e a hora.
 #               Antes era wisedb_coleta_<host>_<data>: duas coletas no mesmo
 #               bastion, no mesmo dia, para clientes diferentes reutilizavam a
@@ -35,11 +39,22 @@
 #   [NOVO]      Coleta OCI ampliada: IPs de instancia, volume groups, block
 #               volumes, Recovery Service, backup config dos DB Systems,
 #               replicacao de bucket e verificacao de copia cross-region.
+#   [NOVO]      Downloads dos modulos usam uma funcao comum: primeiro tenta
+#               validacao TLS normal e, se o curl retornar erro 60 (CA), faz
+#               fallback automatico para -k. O fallback pode ser desligado com
+#               WISEDB_SSL_FALLBACK=0. Toda ocorrencia vira alerta na coleta.
+#   [NOVO]      Falha de modulo deixa a coleta explicitamente INCOMPLETA e o
+#               pacote final fica marcado como pendente, nunca como coleta limpa.
 #===============================================================================
 set -uo pipefail
 
+WISEDB_SSL_FALLBACK="${WISEDB_SSL_FALLBACK:-1}"
+SSL_FALLBACK_USADO=0
+COLETA_INCOMPLETA=0
+declare -a MODULOS_FALHARAM=()
+
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.2"
+VERSAO="3.3"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -69,6 +84,45 @@ info(){ say "  ${CINZA}$*${R}"; }
 ok(){ say "  ${VERD}OK${R}  $*"; }
 warn(){ say "  ${AMAR}!${R}   $*"; ALERTAS+=("$*"); }
 erro(){ say "  ${VERM}X${R}   $*"; }
+
+# Download dos modulos WiseDB. O fallback -k vale somente para BASE_URL;
+# nao e aplicado ao metadata OCI ou a outras conexoes do ambiente.
+wisedb_curl(){
+  local url="$1"; shift
+  local err rc
+  err=$(mktemp "${TMPDIR:-/tmp}/wisedb_curl.XXXXXX") || err=""
+  if [ -n "$err" ]; then
+    curl -fsSL "$url" "$@" 2>"$err"; rc=$?
+  else
+    curl -fsSL "$url" "$@" 2>/dev/null; rc=$?
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    [ -n "$err" ] && rm -f "$err" 2>/dev/null
+    return 0
+  fi
+
+  # Erro 60 = certificado/CA nao confiavel no curl.
+  if [ "$rc" -eq 60 ] && [ "$WISEDB_SSL_FALLBACK" = "1" ]; then
+    SSL_FALLBACK_USADO=1
+    warn "TLS/CA nao confiavel para $url; tentando novamente com -k (fallback SSL habilitado)"
+    if curl -k -fsSL "$url" "$@"; then
+      [ -n "$err" ] && rm -f "$err" 2>/dev/null
+      return 0
+    fi
+  fi
+
+  if [ -n "$err" ]; then
+    cat "$err" >&2 2>/dev/null
+    rm -f "$err" 2>/dev/null
+  fi
+  return "$rc"
+}
+
+wisedb_download(){
+  local module="$1" dest="$2"
+  wisedb_curl "$BASE_URL/$module" -o "$dest"
+}
 
 pergunta(){ # pergunta "label" var "default"
   local label="$1" var="$2" def="${3:-}" resp=""
@@ -134,8 +188,8 @@ menu_sel(){ # menu_sel single|multi "titulo" item...
 say ""
 say "${MARBG}${LAR}${NEG}  WiseDB - Coleta Automatica de Backup  v$VERSAO  ${R}"
 info "Host: $FQDN | Usuario: $(whoami) | $(date '+%d/%m/%Y %H:%M %Z')"
-curl -fsSL "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null 2>/dev/null || \
-  warn "Nao foi possivel baixar modulos de $BASE_URL (verifique WISEDB_BASE_URL e saida HTTPS)"
+wisedb_curl "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null || \
+  warn "Nao foi possivel baixar modulos de $BASE_URL (verifique WISEDB_BASE_URL, HTTPS e/ou WISEDB_SSL_FALLBACK)"
 
 #===============================================================================
 # FASE 1 - DESCOBERTA PROFUNDA (lista TUDO, nao escolhe nada)
@@ -509,17 +563,31 @@ dl(){ local m="$1"; local dest="${TMP_DIGEST:-$TMP}"
   mkdir -p "$dest"
   if   [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$dest/$m"
   elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$dest/$m"
-  else curl -fsSL "$BASE_URL/$m" -o "$dest/$m" || { erro "Falha ao baixar $m"; return 1; }
+  else wisedb_download "$m" "$dest/$m" || { erro "Falha ao baixar $m"; MODULOS_FALHARAM+=("$m"); COLETA_INCOMPLETA=1; return 1; }
        [ -s "$dest/$m" ] || { erro "$m veio vazio"; return 1; }
   fi
   chmod +x "$dest/$m"; }
 
 cd "$WORK"
 if [ "$COLETA_LOCAL" = "1" ]; then
-  dl 01_coleta_linux_geral.sh && bash "$TMP/01_coleta_linux_geral.sh" "${DIR_SEL[@]}" && ok "Inventario local coletado"
-  [ ${#ORA_SEL[@]} -gt 0 ] && dl 02_coleta_oracle.sh && bash "$TMP/02_coleta_oracle.sh" "${ORA_SEL[@]}" && ok "Oracle coletado"
-  [ -n "$SQL_USER" ] && dl 03_coleta_sqlserver_linux.sh && bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,1433" "$SQL_USER" && ok "SQL Server coletado"
-  [ "$HYP_ON" = "1" ] && dl 07_coleta_hypervisor_linux.sh && bash "$TMP/07_coleta_hypervisor_linux.sh" && ok "Hypervisor coletado"
+  if dl 01_coleta_linux_geral.sh; then
+    if bash "$TMP/01_coleta_linux_geral.sh" "${DIR_SEL[@]}"; then ok "Inventario local coletado"; else erro "Modulo 01 falhou durante a coleta"; MODULOS_FALHARAM+=("01_coleta_linux_geral.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+  fi
+  if [ ${#ORA_SEL[@]} -gt 0 ]; then
+    if dl 02_coleta_oracle.sh; then
+      if bash "$TMP/02_coleta_oracle.sh" "${ORA_SEL[@]}"; then ok "Oracle coletado"; else erro "Modulo 02 falhou durante a coleta"; MODULOS_FALHARAM+=("02_coleta_oracle.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+    fi
+  fi
+  if [ -n "$SQL_USER" ]; then
+    if dl 03_coleta_sqlserver_linux.sh; then
+      if bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,1433" "$SQL_USER"; then ok "SQL Server coletado"; else erro "Modulo SQL Server falhou durante a coleta"; MODULOS_FALHARAM+=("03_coleta_sqlserver_linux.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+    fi
+  fi
+  if [ "$HYP_ON" = "1" ]; then
+    if dl 07_coleta_hypervisor_linux.sh; then
+      if bash "$TMP/07_coleta_hypervisor_linux.sh"; then ok "Hypervisor coletado"; else erro "Modulo Hypervisor falhou durante a coleta"; MODULOS_FALHARAM+=("07_coleta_hypervisor_linux.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+    fi
+  fi
   [ "$VEEAM_ON" = "1" ] && { echo "## Veeam Agent Linux"; veeamconfig job list 2>&1; veeamconfig session list 2>&1 | tail -30; } > veeam_agent_linux.txt
 else
   { echo "## CONTEXTO DA ESTACAO DE COLETA - NAO APLICAVEL A POLITICA DO CLIENTE"
@@ -549,8 +617,13 @@ fi
     echo "## [PENDENCIA] agendador do backup fisico em DB System/ODA fica como INFERIDO."
   fi
   echo "## Profundidade: listagem=$WISEDB_LIST_DEPTH niveis, dumps=$WISEDB_DUMP_DEPTH niveis"
+  echo "## Fallback SSL usado: $([ "$SSL_FALLBACK_USADO" = "1" ] && echo SIM || echo NAO)"
+  echo "## Coleta incompleta: $([ "$COLETA_INCOMPLETA" = "1" ] && echo SIM || echo NAO)"
+  if [ ${#MODULOS_FALHARAM[@]} -gt 0 ]; then echo "## Modulos com falha: ${MODULOS_FALHARAM[*]}"; fi
 } > "$WORK/nivel_privilegio_coleta.txt"
 cd "$ORIG_DIR"
+export WISEDB_SSL_FALLBACK_USED="$SSL_FALLBACK_USADO"
+export WISEDB_COLETA_INCOMPLETA="$COLETA_INCOMPLETA"
 
 #===============================================================================
 # FASE 7 - SANITIZACAO, CONSOLIDACAO, SAIDA
@@ -573,6 +646,7 @@ FINAL="$WORK/resultado_final.txt"
   echo "================================================================"
   echo " WISEDB - COLETA AUTOMATICA v$VERSAO"
   echo " Cliente ............: $CLIENTE"
+  echo " Versao do script ...: $VERSAO"
   echo " Host da coleta .....: $FQDN (papel: $PAPEL)"
   echo " Coleta local .......: $([ "$COLETA_LOCAL" = "1" ] && echo "SIM - evidencia do cliente" || echo "NAO - host de ferramenta WiseDB")"
   echo " Instancia OCI local : ${VM_NOME_OCI:-n/a} | tenancy ${VM_TENANCY:-n/a}"
@@ -607,13 +681,15 @@ if rto.startswith("A combinar"): pend.append("RTO nao definido formalmente")
 if local == "0": pend.append("Host de ferramenta: ambiente local do cliente deve ser coletado no servidor do cliente")
 if not prof: pend.append("Coleta OCI nao executada nesta rodada")
 if vmten and ten and vmten != ten and mdok == "1": pend.append("Tenancy da VM difere da do profile: escopo validado manualmente")
+if os.environ.get("WISEDB_SSL_FALLBACK_USED") == "1": pend.append("TLS do GitHub exigiu fallback -k; recomenda-se corrigir a cadeia de CA do sistema")
+if os.environ.get("WISEDB_COLETA_INCOMPLETA") == "1": pend.append("Coleta incompleta: um ou mais modulos/evidencias falharam")
 doc = {
  "schema": "wisedb.coleta.backup/v2",
  "cliente": cli,
  "coleta": {"host": os.uname().nodename, "papel_host": papel,
             "coleta_local_habilitada": local == "1",
             "data": datetime.datetime.now().isoformat(timespec="minutes"),
-            "script_versao": "3.0"},
+            "script_versao": "3.3"},
  "oci": {"profile_usado": prof or None, "tenancy_profile": ten or None,
          "tenancy_reportada_pelo_metadata": vmten or None,
          "metadata_confiavel": mdok == "1",
@@ -651,8 +727,18 @@ if [ "${OKF^^}" != "N" ]; then
   PAC="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}.tar.gz"
   tar -czf "$PAC" -C "$ORIG_DIR" "$(basename "$WORK")"
   say ""
-  say "  ${VERD}${NEG}PRONTO${R}"
+  if [ "$COLETA_INCOMPLETA" = "1" ]; then
+    say "  ${AMAR}${NEG}PACOTE GERADO COM PENDENCIAS${R}"
+  else
+    say "  ${VERD}${NEG}PRONTO${R}"
+  fi
   say "  Pacote completo ..: $PAC"
+  if [ "$SSL_FALLBACK_USADO" = "1" ]; then
+    say "  ${AMAR}Aviso SSL .........: o GitHub exigiu fallback -k; corrija a CA do SO quando possivel${R}"
+  fi
+  if [ ${#MODULOS_FALHARAM[@]} -gt 0 ]; then
+    say "  ${AMAR}Modulos com falha : ${MODULOS_FALHARAM[*]}${R}"
+  fi
   if [ -s "$RESUMO" ]; then
     say "  ${LAR}${NEG}COLE ISTO NA IA${R}: $RESUMO  ${DIM}($(wc -l < "$RESUMO") linhas)${R}"
     say "  Ver com ..........: ${DIM}cat \"$RESUMO\"${R}"
