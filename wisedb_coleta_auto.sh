@@ -571,7 +571,7 @@ dl(){ local m="$1"; local dest="${TMP_DIGEST:-$TMP}"
 cd "$WORK"
 if [ "$COLETA_LOCAL" = "1" ]; then
   if dl 01_coleta_linux_geral.sh; then
-    if bash "$TMP/01_coleta_linux_geral.sh" "${DIR_SEL[@]}"; then ok "Inventario local coletado"; else erro "Modulo 01 falhou durante a coleta"; MODULOS_FALHARAM+=("01_coleta_linux_geral.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+    if bash "$TMP/01_coleta_linux_geral.sh" ${DIR_SEL[@]+"${DIR_SEL[@]}"}; then ok "Inventario local coletado"; else erro "Modulo 01 falhou durante a coleta"; MODULOS_FALHARAM+=("01_coleta_linux_geral.sh(execucao)"); COLETA_INCOMPLETA=1; fi
   fi
   if [ ${#ORA_SEL[@]} -gt 0 ]; then
     if dl 02_coleta_oracle.sh; then
@@ -594,7 +594,7 @@ else
     echo "## Host: $FQDN | Papel: $PAPEL | Coletado em $(date '+%d/%m/%Y %H:%M')"
     echo "## Este host e ferramenta da WiseDB. Cron, discos e bases locais NAO pertencem ao cliente."
     echo; echo "Profiles OCI presentes (apenas nomes, para rastreabilidade):"
-    printf '  - %s\n' "${OCI_PROF[@]}"
+    printf '  - %s\n' ${OCI_PROF[@]+"${OCI_PROF[@]}"}
   } > contexto_estacao_NAO_DO_CLIENTE.txt
   ok "Coleta local suprimida; contexto da estacao registrado em arquivo separado"
 fi
