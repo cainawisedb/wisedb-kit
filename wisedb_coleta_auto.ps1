@@ -12,13 +12,18 @@
             4) Executa a coleta read-only, SANITIZA, mostra RESUMO e pede OK
             5) GERA resultado_final.txt (colar na IA), resultado.json e .zip
  RISCO    : Zero. Somente leitura.
+
+ COMPATIBILIDADE : PowerShell 2.0+ (Windows Server 2008 R2, 2012, 2012 R2, 2016+)
+            Compress-Archive (PS 5.0+) substituido por New-WiseZip, com cadeia
+            de fallback: Compress-Archive -> System.IO.Compression.FileSystem
+            (.NET 4.5) -> Shell.Application (COM, funciona em qualquer versao).
 ===============================================================================
 #>
 # TLS 1.2 obrigatorio: Windows 2008R2/2012R2 negociam TLS 1.0 por padrao no .NET e o GitHub recusa
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
 
 $BaseUrl = if ($env:WISEDB_BASE_URL) { $env:WISEDB_BASE_URL } else { "https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main" }
-$Versao = "2.0"
+$Versao = "2.1"
 $Hostn = $env:COMPUTERNAME
 $Data = Get-Date -Format yyyyMMdd
 $Work = Join-Path (Get-Location) "wisedb_coleta_${Hostn}_${Data}"
@@ -27,7 +32,65 @@ New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 
 Write-Host "==============================================================="
 Write-Host " WiseDB - Coleta Automatica de Backup v$Versao | $Hostn | $(Get-Date -Format 'dd/MM/yyyy HH:mm')"
+Write-Host " PowerShell $($PSVersionTable.PSVersion) | $([Environment]::OSVersion.VersionString)"
 Write-Host "==============================================================="
+
+#=========================== 0. COMPATIBILIDADE =================================
+function Test-Cmd($c){ [bool](Get-Command $c -ErrorAction SilentlyContinue) }
+
+function New-WiseZip {
+<#
+  Gera um .zip a partir de um diretorio, incluindo o diretorio base.
+  Cadeia de fallback para hosts com PowerShell anterior a 5.0.
+#>
+  param(
+    [Parameter(Mandatory=$true)][string]$SourceDir,
+    [Parameter(Mandatory=$true)][string]$ZipPath
+  )
+
+  if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue }
+  $src = (Resolve-Path $SourceDir).Path
+
+  # 1) PS 5.0+
+  if (Test-Cmd 'Compress-Archive') {
+    Compress-Archive -Path $src -DestinationPath $ZipPath -Force
+    return $true
+  }
+
+  # 2) .NET 4.5 (presente por padrao no Server 2012 / 2012 R2)
+  try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+      $src, $ZipPath,
+      [System.IO.Compression.CompressionLevel]::Optimal,
+      $true)
+    Write-Host "  (zip gerado via System.IO.Compression - Compress-Archive indisponivel)" -ForegroundColor DarkGray
+    return $true
+  } catch { }
+
+  # 3) COM Shell.Application - funciona sem dependencia de versao
+  try {
+    $eocd = [byte[]](0x50,0x4B,0x05,0x06) + (New-Object byte[] 18)
+    [System.IO.File]::WriteAllBytes($ZipPath, $eocd)
+
+    $shell = New-Object -ComObject Shell.Application
+    $zipNs = $shell.NameSpace((Resolve-Path $ZipPath).Path)
+    $itens = @(Get-ChildItem -Path $src -Force)
+
+    foreach ($i in $itens) { $zipNs.CopyHere($i.FullName, 16) ; Start-Sleep -Milliseconds 500 }
+
+    $limite = (Get-Date).AddMinutes(10)
+    while ($zipNs.Items().Count -lt $itens.Count -and (Get-Date) -lt $limite) { Start-Sleep -Seconds 1 }
+
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
+    Write-Host "  (zip gerado via Shell.Application - metodos modernos indisponiveis)" -ForegroundColor DarkGray
+    return $true
+  } catch {
+    Write-Host "ERRO: nao foi possivel gerar o .zip automaticamente." -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    return $false
+  }
+}
 
 #=========================== 1. DETECCAO ========================================
 $Det = [ordered]@{
@@ -97,6 +160,7 @@ $cab = @"
 ================================================================
  WISEDB - COLETA AUTOMATICA | Cliente: $Cliente | Host: $Hostn
  Data da coleta: $(Get-Date -Format 'dd/MM/yyyy HH:mm') | Script v$Versao
+ PowerShell: $($PSVersionTable.PSVersion) | SO: $([Environment]::OSVersion.VersionString)
  RPO informado: $RPO | RTO informado: $RTO
  Itens fora do escopo declarados no wizard: $(if ($Excluidos.Count -eq 0){'(nenhum)'} else {($Excluidos | ForEach-Object { "$($_.item) [$($_.justificativa)]" }) -join '; '})
 ================================================================
@@ -108,7 +172,8 @@ Get-ChildItem $Work -Recurse -Filter *.txt | Where-Object Name -ne 'resultado_fi
 }
 [ordered]@{
   schema = "wisedb.coleta.backup/v1"; cliente = $Cliente
-  coleta = @{ host = $Hostn; data = (Get-Date -Format s); script_versao = $Versao; modo = "automatico" }
+  coleta = @{ host = $Hostn; data = (Get-Date -Format s); script_versao = $Versao; modo = "automatico"
+              powershell = $PSVersionTable.PSVersion.ToString(); so = [Environment]::OSVersion.VersionString }
   deteccao = @{}; escopo = @{ fora_do_escopo = $Excluidos }
   rpo_informado = $RPO; rto_informado = $RTO
   evidencias_arquivos = @(Get-ChildItem $Work -Recurse -Filter *.txt | ForEach-Object { $_.FullName.Replace("$Work\","") })
@@ -126,10 +191,11 @@ else { Write-Host " Verificacao de segredos: nenhum remanescente" }
 Write-Host "========================================================================"
 $ok = Read-Host "Gerar pacote final? (S/n)"
 if ($ok -ne 'n' -and $ok -ne 'N') {
-  $zip = "wisedb_coleta_$($Cliente -replace ' ','_')_${Hostn}_${Data}.zip"
-  Compress-Archive -Path $Work -DestinationPath $zip -Force
+  $zip = Join-Path (Get-Location) ("wisedb_coleta_$($Cliente -replace ' ','_')_${Hostn}_${Data}.zip")
+  $gerado = New-WiseZip -SourceDir $Work -ZipPath $zip
   Write-Host "`nPRONTO."
-  Write-Host "  1) Pacote completo : $zip"
+  if ($gerado) { Write-Host "  1) Pacote completo : $zip" }
+  else { Write-Host "  1) Pacote NAO gerado - compacte manualmente a pasta $Work" -ForegroundColor Yellow }
   Write-Host "  2) Para a IA       : $FinalTxt (+ resultado.json)"
   Write-Host "  Cole o conteudo na IA junto com o Modelo_Politica_de_Backup_WiseDB.md"
   Write-Host "  e o prompt Backup Policy Engineer para gerar a politica e o PDF."
