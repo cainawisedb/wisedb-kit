@@ -4,7 +4,7 @@
 
  CONCEITO : Automatico first. Um unico comando no servidor Windows (PS admin):
 
-   irm https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/wisedb_coleta_auto.ps1 | iex
+   irm https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main/wisedb_coleta_auto.ps1 | iex
 
  FLUXO    : 1) DETECTA: SQL Server, Veeam B&R, Veeam Agent, Hyper-V, PowerCLI
             2) WIZARD de confirmacao + itens fora do escopo (com justificativa)
@@ -14,7 +14,10 @@
  RISCO    : Zero. Somente leitura.
 ===============================================================================
 #>
-$BaseUrl = if ($env:WISEDB_BASE_URL) { $env:WISEDB_BASE_URL } else { "https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/kit_coleta_backup" }
+# TLS 1.2 obrigatorio: Windows 2008R2/2012R2 negociam TLS 1.0 por padrao no .NET e o GitHub recusa
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
+
+$BaseUrl = if ($env:WISEDB_BASE_URL) { $env:WISEDB_BASE_URL } else { "https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main" }
 $Versao = "2.0"
 $Hostn = $env:COMPUTERNAME
 $Data = Get-Date -Format yyyyMMdd
@@ -65,15 +68,19 @@ function DL($m) {
   $dst = Join-Path $Tmp $m
   if (Test-Path ".\kit_coleta_backup\$m") { Copy-Item ".\kit_coleta_backup\$m" $dst -Force }
   elseif (Test-Path ".\$m") { Copy-Item ".\$m" $dst -Force }
-  else { Invoke-WebRequest -Uri "$BaseUrl/$m" -OutFile $dst -UseBasicParsing }
+  else {
+    try { Invoke-WebRequest -Uri "$BaseUrl/$m" -OutFile $dst -UseBasicParsing -ErrorAction Stop }
+    catch { Write-Host "ERRO: falha ao baixar $m de $BaseUrl" -ForegroundColor Red; Write-Host "  $($_.Exception.Message)" -ForegroundColor Red; return $null }
+  }
+  if (-not (Test-Path $dst)) { Write-Host "ERRO: modulo $m indisponivel, etapa ignorada" -ForegroundColor Red; return $null }
   return $dst
 }
 Push-Location $Work
 Write-Host "`n--- COLETA (somente leitura) -------------------------------------------"
-if ($Det.sqlserver.on -or $Det.windows.on) { & (DL "04_coleta_sqlserver_windows.ps1") }
-if ($Det.veeamvbr.on) { & (DL "06_coleta_veeam_vbr.ps1") }
+if ($Det.sqlserver.on -or $Det.windows.on) { $mod = DL "04_coleta_sqlserver_windows.ps1"; if ($mod) { & $mod } }
+if ($Det.veeamvbr.on) { $mod = DL "06_coleta_veeam_vbr.ps1"; if ($mod) { & $mod } }
 if ($Det.hyperv.on -or ($Det.vmware.on -and $VCenter)) {
-  & (DL "07_coleta_hypervisor_windows.ps1") -VCenter $VCenter
+  $mod = DL "07_coleta_hypervisor_windows.ps1"; if ($mod) { & $mod -VCenter $VCenter }
 }
 Pop-Location
 
