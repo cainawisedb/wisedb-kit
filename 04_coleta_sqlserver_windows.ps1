@@ -9,6 +9,9 @@
  EXECUCAO : PowerShell como administrador, no proprio servidor:
               powershell -ExecutionPolicy Bypass -File .\04_coleta_sqlserver_windows.ps1
             Parametro opcional -Instancia "SERVIDOR\INSTANCIA" (padrao: local).
+            Parametro opcional -SkipVeeam: ignora o bloco Veeam deste modulo
+            quando o host e servidor VBR e o 06_coleta_veeam_vbr.ps1 vai rodar
+            em seguida (evita varrer o historico de sessoes duas vezes).
             Autenticacao Windows (-E). Nao ha senha em arquivo.
  SAIDA    : .\coleta_<hostname>_<data>\04_windows\
 
@@ -18,7 +21,7 @@
             WMI/schtasks/net use quando ausentes.
 ===============================================================================
 #>
-param([string]$Instancia = $env:COMPUTERNAME)
+param([string]$Instancia = $env:COMPUTERNAME, [switch]$SkipVeeam)
 
 $Hostn = $env:COMPUTERNAME
 $Out = ".\coleta_${Hostn}_$(Get-Date -Format yyyyMMdd)\04_windows"
@@ -27,8 +30,14 @@ $Arq = Join-Path $Out "windows_evidencias.txt"
 
 function Sec($t){ "`n################ $t ################" | Out-File $Arq -Append -Encoding utf8 }
 function Has($c){ [bool](Get-Command $c -ErrorAction SilentlyContinue) }
+# Toda a saida deste modulo vai para arquivo. Sem progresso na tela o operador
+# ve a janela parada e nao sabe se a coleta travou ou esta trabalhando.
+function Diga($t){ Write-Host ("  [{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $t) }
+function Etapa($t){ Sec $t; Diga $t }
 
-Sec "IDENTIFICACAO DO SERVIDOR ($(Get-Date -Format 'dd/MM/yyyy HH:mm'))"
+Diga "Modulo 04 iniciado (saida em $Out)"
+
+Etapa "IDENTIFICACAO DO SERVIDOR ($(Get-Date -Format 'dd/MM/yyyy HH:mm'))"
 if (Has 'Get-ComputerInfo') {
   Get-ComputerInfo -Property CsName, OsName, OsVersion, OsArchitecture |
     Format-List | Out-File $Arq -Append -Encoding utf8
@@ -54,7 +63,7 @@ if (Has 'Get-ComputerInfo') {
     Out-File $Arq -Append -Encoding utf8
 }
 
-Sec "DISCOS E VOLUMES"
+Etapa "DISCOS E VOLUMES"
 if (Has 'Get-Volume') {
   Get-Volume | Select-Object DriveLetter, FileSystemLabel,
     @{n='Total_GB';e={[math]::Round($_.Size/1GB,1)}},
@@ -70,7 +79,7 @@ if (Has 'Get-Volume') {
     Format-Table -Auto | Out-File $Arq -Append -Encoding utf8
 }
 
-Sec "MAPEAMENTOS DE REDE (destinos de backup)"
+Etapa "MAPEAMENTOS DE REDE (destinos de backup)"
 if (Has 'Get-SmbMapping') {
   Get-SmbMapping -ErrorAction SilentlyContinue | Format-Table -Auto | Out-File $Arq -Append -Encoding utf8
 } else {
@@ -80,7 +89,7 @@ if (Has 'Get-SmbMapping') {
     Format-Table -Auto | Out-File $Arq -Append -Encoding utf8
 }
 
-Sec "TAREFAS AGENDADAS RELACIONADAS A BACKUP"
+Etapa "TAREFAS AGENDADAS RELACIONADAS A BACKUP"
 if (Has 'Get-ScheduledTask') {
   Get-ScheduledTask | Where-Object { $_.TaskName -match 'backup|bkp|sql|veeam|rman|dump' -and $_.State -ne 'Disabled' } |
     ForEach-Object {
@@ -132,9 +141,10 @@ ORDER BY j.name;
 "@
 }
 if (Has 'sqlcmd') {
+  # -l 15 evita que uma instancia inacessivel segure o modulo por minutos.
   foreach ($k in $Queries.Keys) {
-    Sec "SQL: $k"
-    sqlcmd -S $Instancia -E -W -s ' | ' -Q "SET NOCOUNT ON; $($Queries[$k])" 2>&1 |
+    Etapa "SQL: $k"
+    sqlcmd -S $Instancia -E -W -s ' | ' -l 15 -Q "SET NOCOUNT ON; $($Queries[$k])" 2>&1 |
       Out-File $Arq -Append -Encoding utf8
   }
 } else {
@@ -147,16 +157,35 @@ if (Has 'sqlcmd') {
 }
 
 # ----------------- Veeam (se o modulo estiver presente) ----------------------
-Sec "VEEAM - JOBS E SESSOES (7 DIAS)"
-try {
-  Import-Module Veeam.Backup.PowerShell -ErrorAction Stop
-  Get-VBRJob | Select-Object Name, JobType, IsScheduleEnabled,
-    @{n='Agendamento';e={$_.ScheduleOptions.OptionsDaily}} |
-    Format-List | Out-File $Arq -Append -Encoding utf8
-  Get-VBRBackupSession | Where-Object { $_.CreationTime -gt (Get-Date).AddDays(-7) } |
-    Select-Object JobName, CreationTime, Result, State |
-    Sort-Object CreationTime | Format-Table -Auto | Out-File $Arq -Append -Encoding utf8
-} catch { "Modulo Veeam nao encontrado neste servidor (ok se Veeam nao for usado aqui)." |
-    Out-File $Arq -Append -Encoding utf8 }
+if ($SkipVeeam) {
+  Sec "VEEAM - DELEGADO AO MODULO 06"
+  "Bloco Veeam ignorado neste modulo por opcao do orquestrador: este host e servidor VBR" |
+    Out-File $Arq -Append -Encoding utf8
+  "e a evidencia completa (jobs, repositorios, imutabilidade, sessoes) vem do 06_coleta_veeam_vbr.ps1." |
+    Out-File $Arq -Append -Encoding utf8
+  Diga "VEEAM: delegado ao modulo 06 (evita varrer o historico de sessoes duas vezes)"
+} else {
+  Etapa "VEEAM - JOBS E SESSOES (7 DIAS)"
+  try {
+    # VBR 10+ expoe o modulo; VBR 9.5 e anterior so tem o snapin.
+    try { Import-Module Veeam.Backup.PowerShell -ErrorAction Stop }
+    catch { Add-PSSnapin VeeamPSSnapin -ErrorAction Stop }
+    Diga "  Veeam carregado; lendo jobs..."
+    Get-VBRJob | Select-Object Name, JobType, IsScheduleEnabled,
+      @{n='Agendamento';e={$_.ScheduleOptions.OptionsDaily}} |
+      Format-List | Out-File $Arq -Append -Encoding utf8
+    Diga "  Lendo sessoes (pode levar minutos em historico longo)..."
+    $ses = @(Get-VBRBackupSession | Where-Object { $_.CreationTime -gt (Get-Date).AddDays(-7) })
+    Diga ("  Sessoes nos ultimos 7 dias: {0}" -f $ses.Count)
+    $ses | Select-Object JobName, CreationTime, Result, State |
+      Sort-Object CreationTime | Format-Table -Auto | Out-File $Arq -Append -Encoding utf8
+  } catch {
+    "Modulo/snapin Veeam nao encontrado neste servidor (ok se Veeam nao for usado aqui)." |
+      Out-File $Arq -Append -Encoding utf8
+    "Detalhe: $($_.Exception.Message)" | Out-File $Arq -Append -Encoding utf8
+    Diga "  Veeam nao disponivel neste host"
+  }
+}
 
+Diga "Modulo 04 concluido"
 Write-Host "Coleta Windows concluida em $Out. Revise antes de enviar."
