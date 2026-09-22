@@ -66,21 +66,23 @@ run(){ local f="$OUT/$1"; local t="$2"; shift 2
 
 #=============================== AWS ============================================
 coleta_aws(){
-  local P="${PROFILE:-default}"
+  local P="${PROFILE:-default}" AQ
   local D14; D14=$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-  local A="aws --profile $P --no-cli-pager --output table"
+  local A="aws --profile $P --no-cli-pager --cli-connect-timeout 5 --cli-read-timeout 30 --output table"
   local base n b d r
 
   # Recurso da AWS so aparece na regiao onde existe. Assumir a regiao do
   # ~/.aws/config gera coleta vazia e a politica sai afirmando que o cliente
   # nao tem backup quando a conta inteira esta em outra regiao.
   if [ -z "$REGIONS" ]; then
+    export AWS_MAX_ATTEMPTS=2 AWS_RETRY_MODE=standard
+    AQ="aws --profile $P --cli-connect-timeout 3 --cli-read-timeout 10 --no-cli-pager"
     base=$(aws configure get region --profile "$P" 2>/dev/null || echo us-east-1)
-    for r in $(aws ec2 describe-regions --profile "$P" --region "${base:-us-east-1}" \
+    for r in $($AQ ec2 describe-regions --region "${base:-us-east-1}" \
                  --query 'Regions[].RegionName' --output text 2>/dev/null | tr '\t' '\n'); do
-      n=$(aws ec2    describe-instances    --profile "$P" --region "$r" --query 'length(Reservations[].Instances[])' --output text 2>/dev/null)
-      b=$(aws backup list-backup-plans     --profile "$P" --region "$r" --query 'length(BackupPlansList)'            --output text 2>/dev/null)
-      d=$(aws rds    describe-db-instances --profile "$P" --region "$r" --query 'length(DBInstances)'                --output text 2>/dev/null)
+      n=$($AQ ec2    describe-instances    --region "$r" --query 'length(Reservations[].Instances[])' --output text 2>/dev/null)
+      b=$($AQ backup list-backup-plans     --region "$r" --query 'length(BackupPlansList)'            --output text 2>/dev/null)
+      d=$($AQ rds    describe-db-instances --region "$r" --query 'length(DBInstances)'                --output text 2>/dev/null)
       case "$n" in ''|*[!0-9]*) n=0;; esac
       case "$b" in ''|*[!0-9]*) b=0;; esac
       case "$d" in ''|*[!0-9]*) d=0;; esac

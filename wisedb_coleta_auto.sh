@@ -112,26 +112,41 @@ erro(){ say "  ${VERM}X${R}   $*"; }
 # AWS Backup ou RDS. Somente chamadas de leitura.
 #-------------------------------------------------------------------------------
 aws_regioes_com_recurso(){
-  local p="$1" base r tmpd n b d t
+  local p="$1" base r tmpd n b d t pid
+  # Sem timeout explicito, uma regiao que nao responde segura o wait por
+  # minutos e o wizard parece travado. Dois segundos de conexao e dez de
+  # leitura, com uma unica tentativa, sao suficientes para um describe.
+  local AQ="aws --profile $p --cli-connect-timeout 3 --cli-read-timeout 10 --no-cli-pager"
+  export AWS_MAX_ATTEMPTS=2 AWS_RETRY_MODE=standard
   base=$(aws configure get region --profile "$p" 2>/dev/null || true)
   local -a regs=()
-  mapfile -t regs < <(aws ec2 describe-regions --profile "$p" --region "${base:-us-east-1}" \
+  mapfile -t regs < <($AQ ec2 describe-regions --region "${base:-us-east-1}" \
                         --query 'Regions[].RegionName' --output text 2>/dev/null |
                       tr '\t' '\n' | grep -v '^$')
   [ ${#regs[@]} -eq 0 ] && { echo "${base:-us-east-1}"; return 0; }
   tmpd=$(mktemp -d "${TMPDIR:-/tmp}/wisedb_awsreg.XXXXXX") || { echo "${base:-us-east-1}"; return 0; }
+  local -a pids=()
   for r in "${regs[@]}"; do
     (
-      n=$(aws ec2     describe-instances    --profile "$p" --region "$r" --query 'length(Reservations[].Instances[])' --output text 2>/dev/null)
-      b=$(aws backup  list-backup-plans     --profile "$p" --region "$r" --query 'length(BackupPlansList)'            --output text 2>/dev/null)
-      d=$(aws rds     describe-db-instances --profile "$p" --region "$r" --query 'length(DBInstances)'                --output text 2>/dev/null)
+      n=$($AQ ec2    describe-instances    --region "$r" --query 'length(Reservations[].Instances[])' --output text 2>/dev/null)
+      b=$($AQ backup list-backup-plans     --region "$r" --query 'length(BackupPlansList)'            --output text 2>/dev/null)
+      d=$($AQ rds    describe-db-instances --region "$r" --query 'length(DBInstances)'                --output text 2>/dev/null)
       case "$n" in ''|*[!0-9]*) n=0;; esac
       case "$b" in ''|*[!0-9]*) b=0;; esac
       case "$d" in ''|*[!0-9]*) d=0;; esac
       t=$((n+b+d)); [ "$t" -gt 0 ] && : > "$tmpd/$r"
+      : > "$tmpd/.fim_$r"
     ) &
+    pids+=($!)
   done
-  wait
+  # Teto absoluto de espera: 90s. Regiao que passar disso e abandonada e
+  # registrada, em vez de deixar o operador diante de uma tela parada.
+  local esperou=0
+  while [ "$(ls -1a "$tmpd" 2>/dev/null | grep -c '^\.fim_')" -lt "${#regs[@]}" ] && [ "$esperou" -lt 90 ]; do
+    sleep 3; esperou=$((esperou+3))
+  done
+  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
+  wait 2>/dev/null
   ls -1 "$tmpd" 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'
   rm -rf "$tmpd"
 }
