@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
-# v3.3 - Wizard blindado (papel do host, multi-tenancy, coerencia de escopo)
+# v3.4 - Wizard blindado + descoberta multicloud integrada (OCI/AWS/GCP/Azure)
 #
 # USO:
 #   export WISEDB_BASE_URL="https://raw.githubusercontent.com/SUAORG/wisedb-kit/main"
@@ -19,6 +19,24 @@
 #   tenancy escolhida entra como evidencia do cliente.
 #
 # RISCO: Zero no ambiente. Somente leitura.
+#
+# v3.4 (setembro/2026)
+#   [NOVO]      Descoberta de nuvem deixa de ser exclusiva da OCI. A FASE 1
+#               inventaria tambem AWS CLI (profiles de ~/.aws), gcloud
+#               (configurations) e Azure CLI (subscriptions), do mesmo modo
+#               como ja inventariava SGBDs. Nada mais precisa ser baixado a mao
+#               nem chamado por fora: o modulo 08 e obtido e executado pelo
+#               proprio orquestrador quando houver alvo selecionado.
+#   [NOVO]      Metadata multicloud: se o servico da OCI nao responder, o
+#               script consulta o IMDS da AWS (token v2), do GCP e do Azure
+#               para saber em qual nuvem esta VM realmente esta.
+#   [NOVO]      Para AWS, o wizard descobre sozinho em quais regioes existem
+#               recursos (EC2, AWS Backup, RDS) e coleta apenas essas, em vez
+#               de assumir uma regiao fixa. Conta AWS aparece no plano.
+#   [NOVO]      Multiplos profiles AWS/gcloud/Azure passam a pontuar como sinal
+#               de host de ferramenta, igual aos profiles OCI.
+#   [NOVO]      Podem ser selecionados varios alvos de nuvem na mesma execucao
+#               (ex.: duas contas AWS do mesmo cliente), cada um com sua pasta.
 #
 # v3.3 (setembro/2026)
 #   [CRITICO]   A pasta de trabalho passa a conter o nome do cliente e a hora.
@@ -54,7 +72,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.3"
+VERSAO="3.4"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -84,6 +102,39 @@ info(){ say "  ${CINZA}$*${R}"; }
 ok(){ say "  ${VERD}OK${R}  $*"; }
 warn(){ say "  ${AMAR}!${R}   $*"; ALERTAS+=("$*"); }
 erro(){ say "  ${VERM}X${R}   $*"; }
+
+#-------------------------------------------------------------------------------
+# AWS nao tem equivalente ao compartment-id-in-subtree da OCI: recurso so
+# aparece na regiao em que existe. Assumir a regiao do ~/.aws/config produz
+# coleta vazia e a politica sai afirmando que o cliente nao tem backup quando
+# na verdade a conta inteira esta em outra regiao. Aqui varremos as regioes
+# habilitadas da conta, em paralelo, e devolvemos so as que tem EC2, plano de
+# AWS Backup ou RDS. Somente chamadas de leitura.
+#-------------------------------------------------------------------------------
+aws_regioes_com_recurso(){
+  local p="$1" base r tmpd n b d t
+  base=$(aws configure get region --profile "$p" 2>/dev/null || true)
+  local -a regs=()
+  mapfile -t regs < <(aws ec2 describe-regions --profile "$p" --region "${base:-us-east-1}" \
+                        --query 'Regions[].RegionName' --output text 2>/dev/null |
+                      tr '\t' '\n' | grep -v '^$')
+  [ ${#regs[@]} -eq 0 ] && { echo "${base:-us-east-1}"; return 0; }
+  tmpd=$(mktemp -d "${TMPDIR:-/tmp}/wisedb_awsreg.XXXXXX") || { echo "${base:-us-east-1}"; return 0; }
+  for r in "${regs[@]}"; do
+    (
+      n=$(aws ec2     describe-instances    --profile "$p" --region "$r" --query 'length(Reservations[].Instances[])' --output text 2>/dev/null)
+      b=$(aws backup  list-backup-plans     --profile "$p" --region "$r" --query 'length(BackupPlansList)'            --output text 2>/dev/null)
+      d=$(aws rds     describe-db-instances --profile "$p" --region "$r" --query 'length(DBInstances)'                --output text 2>/dev/null)
+      case "$n" in ''|*[!0-9]*) n=0;; esac
+      case "$b" in ''|*[!0-9]*) b=0;; esac
+      case "$d" in ''|*[!0-9]*) d=0;; esac
+      t=$((n+b+d)); [ "$t" -gt 0 ] && : > "$tmpd/$r"
+    ) &
+  done
+  wait
+  ls -1 "$tmpd" 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+  rm -rf "$tmpd"
+}
 
 # Download dos modulos WiseDB. O fallback -k vale somente para BASE_URL;
 # nao e aplicado ao metadata OCI ou a outras conexoes do ambiente.
@@ -216,6 +267,45 @@ else
   info "Metadata OCI nao respondeu: on-premises, outra cloud ou metadata bloqueado"
 fi
 
+#-------------------------------------------------------------------------------
+# Metadata das demais nuvens. So e consultado quando a OCI nao respondeu, porque
+# as quatro usam o mesmo IP de link-local (169.254.169.254) e a resposta de uma
+# nuvem invalida a das outras. Serve para o wizard saber onde a VM realmente
+# esta antes de perguntar qualquer coisa ao operador.
+#-------------------------------------------------------------------------------
+NA_AWS=0; NA_GCP=0; NA_AZURE=0
+VM_AWS_ID=""; VM_AWS_ACCT=""; VM_AWS_REG=""
+VM_GCP_NOME=""; VM_GCP_PROJ=""; VM_GCP_ZONA=""
+VM_AZ_NOME=""; VM_AZ_SUB=""; VM_AZ_REG=""
+if [ "$NA_OCI" = "0" ]; then
+  AWS_TOKEN=$(curl -fsS -m 2 -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+  if [ -n "$AWS_TOKEN" ] && curl -fsS -m 2 -H "X-aws-ec2-metadata-token: $AWS_TOKEN" \
+       http://169.254.169.254/latest/dynamic/instance-identity/document -o "$TMP/_md_aws.json" 2>/dev/null; then
+    NA_AWS=1
+    VM_AWS_ID=$(grep -o '"instanceId"[^,]*'  "$TMP/_md_aws.json" | cut -d'"' -f4)
+    VM_AWS_ACCT=$(grep -o '"accountId"[^,]*' "$TMP/_md_aws.json" | cut -d'"' -f4)
+    VM_AWS_REG=$(grep -o '"region"[^,]*'     "$TMP/_md_aws.json" | cut -d'"' -f4)
+    ok "Esta maquina E uma instancia ${NEG}AWS EC2${R}: ${VM_AWS_ID:-?} (conta ${VM_AWS_ACCT:-?}, regiao ${VM_AWS_REG:-?})"
+  elif curl -fsS -m 2 -H "Metadata-Flavor: Google" \
+         http://169.254.169.254/computeMetadata/v1/instance/name -o "$TMP/_md_gcp.txt" 2>/dev/null; then
+    NA_GCP=1
+    VM_GCP_NOME=$(tr -d '\r\n' < "$TMP/_md_gcp.txt")
+    VM_GCP_PROJ=$(curl -fsS -m 2 -H "Metadata-Flavor: Google" \
+                  http://169.254.169.254/computeMetadata/v1/project/project-id 2>/dev/null || true)
+    VM_GCP_ZONA=$(curl -fsS -m 2 -H "Metadata-Flavor: Google" \
+                  http://169.254.169.254/computeMetadata/v1/instance/zone 2>/dev/null | awk -F/ '{print $NF}')
+    ok "Esta maquina E uma instancia ${NEG}Google Compute Engine${R}: ${VM_GCP_NOME:-?} (projeto ${VM_GCP_PROJ:-?}, zona ${VM_GCP_ZONA:-?})"
+  elif curl -fsS -m 2 -H "Metadata:true" \
+         "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01" -o "$TMP/_md_az.json" 2>/dev/null; then
+    NA_AZURE=1
+    VM_AZ_NOME=$(grep -o '"name"[^,]*'           "$TMP/_md_az.json" | head -1 | cut -d'"' -f4)
+    VM_AZ_SUB=$(grep -o '"subscriptionId"[^,]*'  "$TMP/_md_az.json" | cut -d'"' -f4)
+    VM_AZ_REG=$(grep -o '"location"[^,]*'        "$TMP/_md_az.json" | head -1 | cut -d'"' -f4)
+    ok "Esta maquina E uma VM ${NEG}Azure${R}: ${VM_AZ_NOME:-?} (subscription ${VM_AZ_SUB:-?}, regiao ${VM_AZ_REG:-?})"
+  fi
+fi
+
 declare -a ORA_SIDS=()
 if [ -r /etc/oratab ]; then
   while IFS=: read -r sid home rest; do
@@ -287,6 +377,71 @@ if tem oci && [ -r "$OCICFG" ]; then
 fi
 MULTI_TENANT=0; [ ${#OCI_PROF[@]} -gt 1 ] && MULTI_TENANT=1
 
+#-------------------------------------------------------------------------------
+# Demais nuvens. A logica e a mesma da OCI: listar TUDO que existe configurado
+# neste host, sem escolher nada e sem autenticar ainda. A escolha e a validacao
+# acontecem na FASE 4, ja com o nome do cliente conhecido.
+#-------------------------------------------------------------------------------
+declare -a AWS_PROF=() AWS_REG=()
+if tem aws; then
+  AWSCFG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+  AWSCRED="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
+  mapfile -t AWS_PROF < <(
+    { aws configure list-profiles 2>/dev/null
+      # Fallback para CLI v1 ou config ilegivel pelo comando acima
+      sed -n 's/^\[profile \(.*\)\]$/\1/p; s/^\[\(default\)\]$/\1/p' "$AWSCFG"  2>/dev/null
+      sed -n 's/^\[\(.*\)\]$/\1/p'                                  "$AWSCRED" 2>/dev/null
+    } | sed 's/[[:space:]]*$//' | grep -v '^$' | sort -u )
+  for p in ${AWS_PROF[@]+"${AWS_PROF[@]}"}; do
+    AWS_REG+=("$(aws configure get region --profile "$p" 2>/dev/null || true)")
+  done
+  if [ ${#AWS_PROF[@]} -gt 0 ]; then
+    ok "AWS CLI: ${#AWS_PROF[@]} profile(s)"
+    for i in "${!AWS_PROF[@]}"; do info "  - ${AWS_PROF[i]}  ${DIM}regiao ${AWS_REG[i]:-nao definida no config}${R}"; done
+  else
+    info "AWS CLI instalado, porem sem profile configurado neste usuario"
+  fi
+elif [ "$NA_AWS" = "1" ]; then
+  warn "Maquina na AWS sem AWS CLI local: rode a coleta AWS no bastion com o profile do cliente"
+fi
+
+declare -a GCP_CONF=() GCP_ACCT=() GCP_PROJ=()
+if tem gcloud; then
+  while IFS=$'\t' read -r n a pj; do
+    [ -z "${n:-}" ] && continue
+    GCP_CONF+=("$n"); GCP_ACCT+=("${a:-}"); GCP_PROJ+=("${pj:-}")
+  done < <(gcloud config configurations list \
+             --format="value[separator='\t'](name,properties.core.account,properties.core.project)" 2>/dev/null)
+  if [ ${#GCP_CONF[@]} -gt 0 ]; then
+    ok "gcloud CLI: ${#GCP_CONF[@]} configuration(s)"
+    for i in "${!GCP_CONF[@]}"; do
+      info "  - ${GCP_CONF[i]}  ${DIM}projeto ${GCP_PROJ[i]:-nao definido} | conta ${GCP_ACCT[i]:-nao autenticada}${R}"
+    done
+  else
+    info "gcloud instalado, porem sem configuration definida neste usuario"
+  fi
+elif [ "$NA_GCP" = "1" ]; then
+  warn "Maquina no GCP sem gcloud local: rode a coleta GCP no bastion com a configuration do cliente"
+fi
+
+declare -a AZ_SUBID=() AZ_SUBNOME=()
+if tem az; then
+  while IFS=$'\t' read -r sid snome; do
+    [ -z "${sid:-}" ] && continue
+    AZ_SUBID+=("$sid"); AZ_SUBNOME+=("${snome:-}")
+  done < <(az account list --all --query "[].[id,name]" -o tsv 2>/dev/null)
+  if [ ${#AZ_SUBID[@]} -gt 0 ]; then
+    ok "Azure CLI: ${#AZ_SUBID[@]} subscription(s)"
+    for i in "${!AZ_SUBID[@]}"; do info "  - ${AZ_SUBNOME[i]:-sem nome}  ${DIM}...${AZ_SUBID[i]: -12}${R}"; done
+  else
+    info "Azure CLI instalado, porem sem login ativo neste usuario"
+  fi
+elif [ "$NA_AZURE" = "1" ]; then
+  warn "Maquina no Azure sem az CLI local: rode a coleta Azure no bastion com a subscription do cliente"
+fi
+
+CLOUD_ALVOS=$(( ${#AWS_PROF[@]} + ${#GCP_CONF[@]} + ${#AZ_SUBID[@]} ))
+
 declare -a CRON_HITS=()
 cq(){ crontab -l ${2:+-u "$2"} 2>/dev/null | grep -Eic 'backup|rman|expdp|dump|vzdump|rsync|oci os' || true; }
 q=$(cq); [ "${q:-0}" -gt 0 ] && CRON_HITS+=("$(whoami): $q linha(s)")
@@ -321,6 +476,15 @@ case "$HOSTN" in *bastion*|*jump*|*wise*|*monitor*|*zabbix*|*relatorio*|*mgmt*|*
   SCORE_FERR=$((SCORE_FERR+2)); SINAIS+=("hostname sugere infraestrutura de gestao: $HOSTN");; esac
 if [ ${#OCI_PROF[@]} -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ]; then
   SCORE_FERR=$((SCORE_FERR+1)); SINAIS+=("tem OCI CLI mas nenhum SGBD de producao local")
+fi
+# Um bastion com N contas AWS, N projetos GCP ou N subscriptions Azure e tao
+# host de ferramenta quanto um com N tenancies OCI. Sem esta pontuacao o wizard
+# tratava o bastion multicloud como servidor do cliente.
+[ ${#AWS_PROF[@]} -gt 1 ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#AWS_PROF[@]} profiles AWS de contas distintas no mesmo host"); }
+[ ${#GCP_CONF[@]} -gt 1 ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#GCP_CONF[@]} configurations gcloud no mesmo host"); }
+[ ${#AZ_SUBID[@]} -gt 1 ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#AZ_SUBID[@]} subscriptions Azure no mesmo host"); }
+if [ "$CLOUD_ALVOS" -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ]; then
+  SCORE_FERR=$((SCORE_FERR+1)); SINAIS+=("tem CLI de nuvem publica mas nenhum SGBD de producao local")
 fi
 
 #===============================================================================
@@ -521,6 +685,72 @@ elif [ "$NA_OCI" = "1" ]; then
   warn "Maquina na OCI sem OCI CLI local: rode a coleta OCI no bastion com o profile do cliente"
 fi
 
+#-------------------------------------------------------------------------------
+# Nuvens publicas alem da OCI. Selecao MULTIPLA de proposito: e comum o mesmo
+# cliente ter duas contas AWS (producao e um ambiente separado), ou AWS e GCP
+# ao mesmo tempo. Cada alvo marcado vira uma execucao propria do modulo 08.
+# Formato de CLOUD_SEL: PROVEDOR|IDENTIFICADOR|EXTRA|REGIOES
+#-------------------------------------------------------------------------------
+declare -a CLOUD_SEL=()
+if [ "$CLOUD_ALVOS" -gt 0 ]; then
+  declare -a CL_PROV=() CL_ID=() CL_EXTRA=() disp=()
+  for i in ${AWS_PROF[@]+"${!AWS_PROF[@]}"}; do
+    CL_PROV+=("AWS"); CL_ID+=("${AWS_PROF[i]}"); CL_EXTRA+=("${AWS_REG[i]:-}")
+    mark=""; casa_cliente "${AWS_PROF[i]}" && mark="  ${VERD}<= parece ser deste cliente${R}"
+    disp+=("${NEG}AWS${R}    ${AWS_PROF[i]}  ${DIM}regiao config: ${AWS_REG[i]:-nao definida}${R}$mark")
+  done
+  for i in ${GCP_CONF[@]+"${!GCP_CONF[@]}"}; do
+    CL_PROV+=("GCP"); CL_ID+=("${GCP_CONF[i]}"); CL_EXTRA+=("${GCP_PROJ[i]:-}")
+    mark=""; { casa_cliente "${GCP_CONF[i]}" || casa_cliente "${GCP_PROJ[i]:-}"; } && mark="  ${VERD}<= parece ser deste cliente${R}"
+    disp+=("${NEG}GCP${R}    ${GCP_CONF[i]}  ${DIM}projeto ${GCP_PROJ[i]:-nao definido}${R}$mark")
+  done
+  for i in ${AZ_SUBID[@]+"${!AZ_SUBID[@]}"}; do
+    CL_PROV+=("AZURE"); CL_ID+=("${AZ_SUBID[i]}"); CL_EXTRA+=("${AZ_SUBNOME[i]:-}")
+    mark=""; casa_cliente "${AZ_SUBNOME[i]:-}" && mark="  ${VERD}<= parece ser deste cliente${R}"
+    disp+=("${NEG}AZURE${R}  ${AZ_SUBNOME[i]:-sem nome}  ${DIM}...${AZ_SUBID[i]: -12}${R}$mark")
+  done
+  menu_sel multi "Contas de nuvem publica do cliente '$CLIENTE' a coletar (ESPACO marca, ENTER sem marcar = nenhuma)" "${disp[@]}"
+  if [ ${#MENU_SEL[@]} -eq 0 ]; then
+    info "Nenhuma conta AWS/GCP/Azure marcada: coleta de nuvem publica adicional nao sera executada"
+  else
+    for i in "${MENU_SEL[@]}"; do
+      prov="${CL_PROV[i]}"; id="${CL_ID[i]}"; extra="${CL_EXTRA[i]}"; regs=""
+      case "$prov" in
+        AWS)
+          if ident=$(aws sts get-caller-identity --profile "$id" --output text \
+                     --query 'join(`" | "`, [Account, Arn])' 2>/dev/null); then
+            ok "AWS '$id' autenticado: $ident"
+            case "$ident" in *:user/*|*root*) warn "Credencial AWS do profile '$id' parece administrativa/estatica: registrar como risco na politica";; esac
+            info "Descobrindo em quais regioes existem recursos no profile '$id' (pode levar ~1 min)..."
+            regs=$(aws_regioes_com_recurso "$id")
+            if [ -n "$regs" ]; then ok "Regioes com recurso: $regs"
+            else regs="${extra:-us-east-1}"; warn "Nenhum recurso EC2/Backup/RDS encontrado nas regioes habilitadas; usando $regs para registrar a ausencia"; fi
+          else
+            warn "Profile AWS '$id' nao autenticou: alvo descartado"; continue
+          fi;;
+        GCP)
+          if gcloud --configuration="$id" auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | grep -q .; then
+            proj=$(gcloud --configuration="$id" config get-value project 2>/dev/null | grep -v '^(unset)$' || true)
+            [ -z "$proj" ] && { warn "Configuration GCP '$id' sem projeto definido"; pergunta "  ID do projeto GCP para '$id'" proj ""; }
+            [ -z "$proj" ] && { warn "Sem projeto: alvo GCP '$id' descartado"; continue; }
+            extra="$proj"; ok "GCP '$id' autenticado no projeto $proj"
+          else
+            warn "Configuration GCP '$id' sem conta ativa (rode gcloud auth activate-service-account): alvo descartado"; continue
+          fi;;
+        AZURE)
+          if az account show --subscription "$id" >/dev/null 2>&1; then
+            ok "Azure '${extra:-$id}' autenticado"
+          else
+            warn "Subscription Azure '$id' nao respondeu: alvo descartado"; continue
+          fi;;
+      esac
+      CLOUD_SEL+=("$prov|$id|$extra|$regs")
+    done
+  fi
+elif [ "$NA_AWS" = "1" ] || [ "$NA_GCP" = "1" ] || [ "$NA_AZURE" = "1" ]; then
+  warn "VM em nuvem publica sem CLI correspondente neste host: a coleta da nuvem precisa rodar no bastion"
+fi
+
 SQL_USER=""
 [ "$COLETA_LOCAL" = "1" ] && [ "$SQL_ON" = "1" ] && \
   pergunta "Usuario de LEITURA do SQL Server (senha pedida na hora, nao e salva)" SQL_USER ""
@@ -546,6 +776,19 @@ say "  Coleta local ......: $([ "$COLETA_LOCAL" = "1" ] && echo "${VERD}SIM${R}"
 [ -n "$SQL_USER" ] && say "  SQL Server ........: usuario $SQL_USER"
 [ ${#DIR_SEL[@]} -gt 0 ] && say "  Diretorios ........: ${DIR_SEL[*]}"
 say "  OCI ...............: ${OCI_SEL_PROF:-nao sera coletado}${OCI_SEL_PROF:+ (tenancy ...${OCI_SEL_TEN: -12})}"
+if [ ${#CLOUD_SEL[@]} -gt 0 ]; then
+  say "  Nuvem publica .....: ${#CLOUD_SEL[@]} alvo(s)"
+  for c in "${CLOUD_SEL[@]}"; do
+    IFS='|' read -r cp ci ce cr <<< "$c"
+    case "$cp" in
+      AWS)   info "  - AWS   profile $ci ${DIM}regioes: ${cr:-padrao}${R}";;
+      GCP)   info "  - GCP   configuration $ci ${DIM}projeto ${ce}${R}";;
+      AZURE) info "  - AZURE ${ce:-$ci} ${DIM}...${ci: -12}${R}";;
+    esac
+  done
+else
+  say "  Nuvem publica .....: nenhuma alem da OCI"
+fi
 say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
 say "  RPO / RTO .........: $RPO / $RTO"
 if [ ${#ALERTAS[@]} -gt 0 ]; then
@@ -595,6 +838,12 @@ else
     echo "## Este host e ferramenta da WiseDB. Cron, discos e bases locais NAO pertencem ao cliente."
     echo; echo "Profiles OCI presentes (apenas nomes, para rastreabilidade):"
     printf '  - %s\n' ${OCI_PROF[@]+"${OCI_PROF[@]}"}
+    echo; echo "Profiles AWS presentes:"
+    [ ${#AWS_PROF[@]}  -gt 0 ] && printf '  - %s\n' "${AWS_PROF[@]}"  || echo "  (nenhum)"
+    echo; echo "Configurations gcloud presentes:"
+    [ ${#GCP_CONF[@]}  -gt 0 ] && printf '  - %s\n' "${GCP_CONF[@]}"  || echo "  (nenhuma)"
+    echo; echo "Subscriptions Azure presentes:"
+    [ ${#AZ_SUBID[@]}  -gt 0 ] && printf '  - %s\n' "${AZ_SUBNOME[@]}" || echo "  (nenhuma)"
   } > contexto_estacao_NAO_DO_CLIENTE.txt
   ok "Coleta local suprimida; contexto da estacao registrado em arquivo separado"
 fi
@@ -605,6 +854,24 @@ if [ -n "$OCI_SEL_PROF" ]; then
   dl 05_coleta_oci.sh && bash "$TMP/05_coleta_oci.sh" --profile "$OCI_SEL_PROF" \
      ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" \
      --obj-limit "${WISEDB_OBJ_LIMIT:-50}" && ok "OCI coletado (tenancy do cliente)"
+fi
+
+# Nuvem publica alem da OCI. O modulo 08 e baixado pelo proprio orquestrador,
+# uma execucao por alvo marcado, cada uma com pasta propria dentro de $WORK.
+if [ ${#CLOUD_SEL[@]} -gt 0 ]; then
+  if dl 08_coleta_cloud_outras.sh; then
+    for c in "${CLOUD_SEL[@]}"; do
+      IFS='|' read -r cp ci ce cr <<< "$c"
+      info "Coletando nuvem $cp ($ci). Somente leitura; em conta grande pode demorar."
+      case "$cp" in
+        AWS)   bash "$TMP/08_coleta_cloud_outras.sh" aws   --profile "$ci" ${cr:+--regions "$cr"};;
+        GCP)   bash "$TMP/08_coleta_cloud_outras.sh" gcp   --configuration "$ci" --project "$ce";;
+        AZURE) bash "$TMP/08_coleta_cloud_outras.sh" azure --subscription "$ci";;
+      esac
+      if [ $? -eq 0 ]; then ok "$cp coletado ($ci)"
+      else erro "Modulo 08 falhou para $cp/$ci"; MODULOS_FALHARAM+=("08_coleta_cloud_outras.sh($cp:$ci)"); COLETA_INCOMPLETA=1; fi
+    done
+  fi
 fi
 # Registro explicito do nivel de privilegio da coleta. Entra no resultado_final e
 # permite a quem le a politica saber se o cron de sistema foi de fato auditado.
