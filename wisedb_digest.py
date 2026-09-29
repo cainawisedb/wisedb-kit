@@ -10,6 +10,11 @@ Os arquivos brutos completos permanecem no pacote .tar.gz.
 Uso: python3 wisedb_digest.py <pasta_coleta> <cliente> <papel_host> [saida]
 Compativel com Python 3.6+ (sem f-strings aninhadas).
 
+Versao 2.2 (setembro/2026)
+  [NOVO]      Secao EVIDENCIAS DE RESTAURACAO (Anexo I), lida do modulo 09
+              (09_restore/anexo_I_evidencias.txt). Alertas do modulo 09 entram
+              na lista de ALERTAS AUTOMATICOS.
+
 Versao 2.1 (setembro/2026)
   [CORRIGIDO] Resolucao de pasta: o wizard passa a pasta de trabalho
               (wisedb_coleta_<host>_<data>) mas os coletores gravam em
@@ -75,7 +80,8 @@ def tem_evidencia(d):
     return (os.path.isdir(os.path.join(d, "01_linux")) or
             os.path.isdir(os.path.join(d, "02_oracle")) or
             os.path.isdir(os.path.join(d, "03_sqlserver")) or
-            os.path.isdir(os.path.join(d, "04_windows")))
+            os.path.isdir(os.path.join(d, "04_windows")) or
+            os.path.isdir(os.path.join(d, "09_restore")))
 
 
 def bases_com_evidencia(r):
@@ -97,7 +103,7 @@ def bases_com_evidencia(r):
             achadas.append(d)
     if not achadas:
         for atual, dirs, _ in os.walk(r):
-            if any(x in dirs for x in ("01_linux", "02_oracle", "03_sqlserver", "04_windows")):
+            if any(x in dirs for x in ("01_linux", "02_oracle", "03_sqlserver", "04_windows", "09_restore")):
                 achadas.append(atual)
     return achadas
 
@@ -769,6 +775,29 @@ for arq, tit in [("veeam_agent_linux.txt", "VEEAM AGENT (Linux)"),
             if s.strip() and not s.startswith("#####"):
                 add("  " + s[:100])
 
+# ===================== 5b. EVIDENCIAS DE RESTAURACAO ========================
+RST_OK = False
+ax = ler_ev(os.path.join("09_restore", "anexo_I_evidencias.txt"))
+if ax.strip():
+    RST_OK = True
+    sec("EVIDENCIAS DE RESTAURACAO (Anexo I)")
+    linhas = [l.rstrip() for l in ax.splitlines()]
+    # Cabecalho do modulo (contagens, agendamentos) completo; registros limitados
+    corte = next((i for i, l in enumerate(linhas) if l.startswith("-----")), len(linhas))
+    for l in linhas[:corte]:
+        if l.strip() and not l.startswith("====="):
+            add("  " + l.strip()[:118])
+    regs = linhas[corte:]
+    n_reg = sum(1 for l in regs if "REGISTRO DE TESTE #" in l)
+    for l in regs[:34 * 6]:
+        if l.strip() and not l.startswith("-----"):
+            add("  " + l.strip()[:118])
+    if n_reg > 6:
+        add("  (... " + str(n_reg - 6) + " registro(s) adicionais em 09_restore/anexo_I_evidencias.txt)")
+    for a in ler_ev(os.path.join("09_restore", "alertas.txt")).splitlines():
+        if a.strip():
+            ALERTAS.append("Teste de restauracao: " + a.strip())
+
 # ============================ 6. ALERTAS ====================================
 sec("ALERTAS AUTOMATICOS (para a IA classificar como gap/risco)")
 if ALERTAS:
@@ -782,7 +811,10 @@ else:
 
 sec("PENDENCIAS DE ESCOPO")
 add("  - RPO/RTO acordados: verificar no cabecalho do resultado_final.txt")
-add("  - Teste de restauracao: nao coletavel automaticamente; anexar Anexo I se existir")
+if RST_OK:
+    add("  - Teste de restauracao: ver secao EVIDENCIAS DE RESTAURACAO; campos [A PREENCHER] nao inventar")
+else:
+    add("  - Teste de restauracao: modulo 09 nao executado nesta coleta; anexar Anexo I se existir")
 add("  - Definir data de teste apenas apos checar o calendario compartilhado de janelas")
 add("")
 add("#" * 70)

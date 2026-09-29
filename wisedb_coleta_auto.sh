@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
-# v3.4 - Wizard blindado + descoberta multicloud integrada (OCI/AWS/GCP/Azure)
+# v3.5 - Wizard blindado + multicloud + evidencias de teste de restauracao
 #
 # USO:
 #   export WISEDB_BASE_URL="https://raw.githubusercontent.com/SUAORG/wisedb-kit/main"
@@ -19,6 +19,24 @@
 #   tenancy escolhida entra como evidencia do cliente.
 #
 # RISCO: Zero no ambiente. Somente leitura.
+#
+# v3.5 (setembro/2026)
+#   [NOVO]      FASE 0 - MODO DA COLETA. Duas opcoes no wizard:
+#                 COLETA COMPLETA + EVIDENCIAS DE RESTAURACAO (padrao): tudo o
+#                 que ja era coletado, mais a varredura de clonagens.
+#                 SOMENTE EVIDENCIAS DE RESTAURACAO: para politicas ja emitidas;
+#                 pula SGBD, OCI e nuvens e gera apenas os dados do Anexo I.
+#               Sem terminal interativo: WISEDB_MODO=COMPLETA|RESTORE.
+#   [NOVO]      Modulo 09_coleta_evidencias_restore.sh: varre logs e scripts de
+#               clonagem (/wisedb/scripts/logs, /wisedb/scripts/clone, /wisedb,
+#               /home/oracle, diretorios citados no cron e extras informados),
+#               classifica cada execucao (BACKUP_RMAN, ACTIVE_DATABASE, DATAPUMP,
+#               SQLSERVER, INDETERMINADO) e gera os registros no formato do
+#               Anexo I. Clone via Active Database e registrado, mas nunca conta
+#               como teste de restauracao.
+#   [NOVO]      Tempo previsto do Anexo I: RTO informado (modo completo) ou
+#               pergunta propria (modo evidencias).
+#   [NOVO]      Mascara de segredos da FASE 7 passa a cobrir SENHA e -P.
 #
 # v3.4 (setembro/2026)
 #   [NOVO]      Descoberta de nuvem deixa de ser exclusiva da OCI. A FASE 1
@@ -72,7 +90,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.4"
+VERSAO="3.5"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -258,6 +276,24 @@ wisedb_curl "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null || \
   warn "Nao foi possivel baixar modulos de $BASE_URL (verifique WISEDB_BASE_URL, HTTPS e/ou WISEDB_SSL_FALLBACK)"
 
 #===============================================================================
+# FASE 0 - MODO DA COLETA
+#===============================================================================
+titulo "FASE 0 - MODO DA COLETA"
+MODO="${WISEDB_MODO:-}"
+if [ -z "$MODO" ]; then
+  menu_sel single "O que esta execucao deve produzir?" \
+   "${NEG}COLETA COMPLETA + EVIDENCIAS DE RESTAURACAO${R} - politica nova ou revisao completa (padrao)" \
+   "${NEG}SOMENTE EVIDENCIAS DE RESTAURACAO${R} - dados do Anexo I para politica ja emitida"
+  case "${MENU_SEL[0]:-0}" in 1) MODO="RESTORE";; *) MODO="COMPLETA";; esac
+fi
+case "$(echo "$MODO" | tr '[:lower:]' '[:upper:]')" in RESTORE|SOMENTE_RESTORE|EVIDENCIAS) MODO="RESTORE";; *) MODO="COMPLETA";; esac
+if [ "$MODO" = "RESTORE" ]; then
+  ok "Modo: ${NEG}SOMENTE EVIDENCIAS DE RESTAURACAO${R} (SGBD, OCI e nuvens nao serao coletados)"
+else
+  ok "Modo: ${NEG}COLETA COMPLETA + EVIDENCIAS DE RESTAURACAO${R}"
+fi
+
+#===============================================================================
 # FASE 1 - DESCOBERTA PROFUNDA (lista TUDO, nao escolhe nada)
 #===============================================================================
 titulo "FASE 1 - DESCOBERTA DO AMBIENTE"
@@ -375,7 +411,10 @@ HYP_ON=0; VEEAM_ON=0
 { tem pvesh || tem proxmox-backup-manager || { tem virsh && ! tem pvesh; }; } && { HYP_ON=1; ok "Hypervisor Linux detectado"; }
 tem veeamconfig && { VEEAM_ON=1; ok "Veeam Agent for Linux presente"; }
 
-declare -a OCI_PROF=() OCI_TEN=() OCI_REG=()
+declare -a OCI_PROF=() OCI_TEN=() OCI_REG=() AWS_PROF=() AWS_REG=() GCP_CONF=() GCP_ACCT=() GCP_PROJ=()
+declare -a AZ_SUBID=() AZ_SUBNOME=() CRON_HITS=() DIR_CAND=()
+MULTI_TENANT=0; CLOUD_ALVOS=0
+if [ "$MODO" = "COMPLETA" ]; then
 OCICFG="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
 if tem oci && [ -r "$OCICFG" ]; then
   cur=""
@@ -397,7 +436,6 @@ MULTI_TENANT=0; [ ${#OCI_PROF[@]} -gt 1 ] && MULTI_TENANT=1
 # neste host, sem escolher nada e sem autenticar ainda. A escolha e a validacao
 # acontecem na FASE 4, ja com o nome do cliente conhecido.
 #-------------------------------------------------------------------------------
-declare -a AWS_PROF=() AWS_REG=()
 if tem aws; then
   AWSCFG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
   AWSCRED="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
@@ -420,7 +458,6 @@ elif [ "$NA_AWS" = "1" ]; then
   warn "Maquina na AWS sem AWS CLI local: rode a coleta AWS no bastion com o profile do cliente"
 fi
 
-declare -a GCP_CONF=() GCP_ACCT=() GCP_PROJ=()
 if tem gcloud; then
   while IFS=$'\t' read -r n a pj; do
     [ -z "${n:-}" ] && continue
@@ -439,7 +476,6 @@ elif [ "$NA_GCP" = "1" ]; then
   warn "Maquina no GCP sem gcloud local: rode a coleta GCP no bastion com a configuration do cliente"
 fi
 
-declare -a AZ_SUBID=() AZ_SUBNOME=()
 if tem az; then
   while IFS=$'\t' read -r sid snome; do
     [ -z "${sid:-}" ] && continue
@@ -457,7 +493,6 @@ fi
 
 CLOUD_ALVOS=$(( ${#AWS_PROF[@]} + ${#GCP_CONF[@]} + ${#AZ_SUBID[@]} ))
 
-declare -a CRON_HITS=()
 cq(){ crontab -l ${2:+-u "$2"} 2>/dev/null | grep -Eic 'backup|rman|expdp|dump|vzdump|rsync|oci os' || true; }
 q=$(cq); [ "${q:-0}" -gt 0 ] && CRON_HITS+=("$(whoami): $q linha(s)")
 for u in oracle root mssql postgres mysql backup relatorio; do
@@ -483,6 +518,18 @@ mapfile -t DIR_CAND < "$TMP/_dirs"
 if [ ${#DIR_CAND[@]} -gt 0 ]; then
   ok "Diretorios candidatos a repositorio: ${#DIR_CAND[@]}"
   for d in "${DIR_CAND[@]}"; do info "  - $d ${DIM}$(df -h "$d" 2>/dev/null | awk 'NR==2{print "("$2" total, "$5" usado)"}')${R}"; done
+fi
+fi # fim do bloco exclusivo do modo COMPLETA
+
+# Previa das evidencias de clonagem (a varredura completa e feita pelo modulo 09)
+RST_PREVIA=$(for d in /wisedb/scripts/logs /wisedb/scripts/clone /wisedb/scripts /wisedb /home/oracle; do
+               [ -d "$d" ] && find "$d" -maxdepth 4 -type f \( -iname '*clon*' -o -iname '*duplic*' -o -iname '*refresh*' \) \
+                 -mtime -"${WISEDB_CLONE_DAYS:-365}" 2>/dev/null
+             done | sort -u | wc -l)
+if [ "${RST_PREVIA:-0}" -gt 0 ]; then
+  ok "Evidencias de clonagem: $RST_PREVIA arquivo(s) Clone*/duplicate/refresh nos diretorios padrao"
+else
+  info "Nenhum arquivo de clonagem nos diretorios padrao; o modulo 09 tambem varre o cron e diretorios extras"
 fi
 
 SCORE_FERR=0; declare -a SINAIS=()
@@ -526,6 +573,10 @@ ok "Papel: ${NEG}$PAPEL${R}"
 [ "$COLETA_LOCAL" = "0" ] && warn "Coleta LOCAL desabilitada: cron, discos e bases deste host nao serao tratados como do cliente"
 [ "$PAPEL" = "HOST_DO_CLIENTE" ] && [ "$MULTI_TENANT" = "1" ] && \
   warn "Host declarado do cliente, porem ha ${#OCI_PROF[@]} tenancies configuradas aqui. Revise o config OCI."
+if [ "$MODO" = "RESTORE" ] && [ "$COLETA_LOCAL" = "0" ]; then
+  erro "Evidencias de clonagem sao arquivos locais: rode este modo no servidor do cliente onde a clonagem executa."
+  exit 1
+fi
 
 #===============================================================================
 # FASE 3 - CLIENTE
@@ -568,8 +619,15 @@ if [ "$COERENTE" = "0" ]; then
     warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
   fi
 fi
-pergunta "RPO acordado (ENTER se nao definido)" RPO "A combinar com o cliente"
-pergunta "RTO acordado (ENTER se nao definido)" RTO "A combinar com o cliente"
+TEMPO_PREVISTO=""
+if [ "$MODO" = "COMPLETA" ]; then
+  pergunta "RPO acordado (ENTER se nao definido)" RPO "A combinar com o cliente"
+  pergunta "RTO acordado (ENTER se nao definido)" RTO "A combinar com o cliente"
+  case "$RTO" in "A combinar"*) ;; *) TEMPO_PREVISTO="$RTO";; esac
+else
+  RPO="Nao coletado (modo evidencias)"; RTO="Nao coletado (modo evidencias)"
+  pergunta "Tempo previsto de restauracao da politica (ex.: 4h, 90min, 04:30; ENTER se nao definido)" TEMPO_PREVISTO ""
+fi
 
 #-------------------------------------------------------------------------------
 # Pasta de trabalho definitiva: cliente + host + data + hora.
@@ -581,7 +639,8 @@ pergunta "RTO acordado (ENTER se nao definido)" RTO "A combinar com o cliente"
 # RESUMO de um cliente descrevendo o ambiente do outro. Dado de cliente
 # vazando para o documento de outro cliente e o pior defeito possivel aqui.
 #-------------------------------------------------------------------------------
-WORK="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}_${HORA}"
+SUF_MODO=""; [ "$MODO" = "RESTORE" ] && SUF_MODO="_restore"
+WORK="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}_${HORA}${SUF_MODO}"
 if [ -d "$WORK" ]; then
   warn "Pasta $WORK ja existe; usando sufixo para nao misturar coletas"
   WORK="${WORK}_$$"
@@ -635,7 +694,9 @@ export WISEDB_DUMP_DEPTH="${WISEDB_DUMP_DEPTH:-5}"
 # FASE 4 - ESCOPO
 #===============================================================================
 titulo "FASE 4 - ESCOPO DA COLETA"
-declare -a ORA_SEL=() DIR_SEL=()
+declare -a ORA_SEL=() DIR_SEL=() CLOUD_SEL=() EXCL=()
+OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; SQL_USER=""
+if [ "$MODO" = "COMPLETA" ]; then
 if [ "$COLETA_LOCAL" = "1" ] && [ ${#ORA_SIDS[@]} -gt 0 ]; then
   disp=(); for s in "${ORA_SIDS[@]}"; do disp+=("${NEG}${s%%|*}${R}  ${DIM}${s##*|}${R}"); done
   menu_sel multi "Instancias Oracle a INCLUIR (ESPACO marca, 'a' = todas)" "${disp[@]}"
@@ -653,7 +714,6 @@ if [ "$COLETA_LOCAL" = "1" ] && [ ${#DIR_CAND[@]} -gt 0 ]; then
   else for i in "${MENU_SEL[@]}"; do DIR_SEL+=("${DIR_CAND[i]}"); done; fi
 fi
 
-OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""
 if [ ${#OCI_PROF[@]} -gt 0 ]; then
   disp=()
   for i in "${!OCI_PROF[@]}"; do
@@ -706,7 +766,6 @@ fi
 # ao mesmo tempo. Cada alvo marcado vira uma execucao propria do modulo 08.
 # Formato de CLOUD_SEL: PROVEDOR|IDENTIFICADOR|EXTRA|REGIOES
 #-------------------------------------------------------------------------------
-declare -a CLOUD_SEL=()
 if [ "$CLOUD_ALVOS" -gt 0 ]; then
   declare -a CL_PROV=() CL_ID=() CL_EXTRA=() disp=()
   for i in ${AWS_PROF[@]+"${!AWS_PROF[@]}"}; do
@@ -766,11 +825,9 @@ elif [ "$NA_AWS" = "1" ] || [ "$NA_GCP" = "1" ] || [ "$NA_AZURE" = "1" ]; then
   warn "VM em nuvem publica sem CLI correspondente neste host: a coleta da nuvem precisa rodar no bastion"
 fi
 
-SQL_USER=""
 [ "$COLETA_LOCAL" = "1" ] && [ "$SQL_ON" = "1" ] && \
   pergunta "Usuario de LEITURA do SQL Server (senha pedida na hora, nao e salva)" SQL_USER ""
 
-declare -a EXCL=()
 if [ "$INTER" = "1" ]; then
   while :; do
     pergunta "Ambiente/base FORA do escopo da politica (nome, ENTER p/ seguir)" IT ""
@@ -779,19 +836,35 @@ if [ "$INTER" = "1" ]; then
     EXCL+=("$IT|$JU")
   done
 fi
+fi # fim do escopo exclusivo do modo COMPLETA
+
+# Evidencias de restauracao (modulo 09): somente onde a clonagem roda, ou seja,
+# em host do cliente ou misto. Em estacao de coleta nao ha log de clone do cliente.
+RST_DIRS=""; RST_ON=0
+if [ "$COLETA_LOCAL" = "1" ]; then
+  RST_ON=1
+  info "Evidencias de restauracao: varredura de /wisedb/scripts/logs, /wisedb/scripts/clone, /wisedb,"
+  info "/home/oracle e dos diretorios citados no cron (arquivos Clone*/duplicate/refresh e logs de DUPLICATE)."
+  pergunta "Diretorios EXTRAS com logs de clonagem (separados por ':', ENTER p/ nenhum)" RST_DIRS ""
+else
+  info "Evidencias de restauracao nao coletadas neste host (estacao de coleta)"
+fi
 
 #===============================================================================
 # FASE 5 - CONFIRMACAO
 #===============================================================================
 titulo "FASE 5 - CONFIRMACAO DO PLANO"
+say "  Modo ..............: ${NEG}$([ "$MODO" = "RESTORE" ] && echo "SOMENTE EVIDENCIAS DE RESTAURACAO" || echo "COMPLETA + EVIDENCIAS DE RESTAURACAO")${R}"
 say "  Cliente ...........: ${NEG}$CLIENTE${R}"
 say "  Papel do host .....: ${NEG}$PAPEL${R}"
 say "  Coleta local ......: $([ "$COLETA_LOCAL" = "1" ] && echo "${VERD}SIM${R}" || echo "${VERM}NAO (host de ferramenta)${R}")"
 [ ${#ORA_SEL[@]} -gt 0 ] && say "  Oracle ............: ${ORA_SEL[*]}"
 [ -n "$SQL_USER" ] && say "  SQL Server ........: usuario $SQL_USER"
 [ ${#DIR_SEL[@]} -gt 0 ] && say "  Diretorios ........: ${DIR_SEL[*]}"
-say "  OCI ...............: ${OCI_SEL_PROF:-nao sera coletado}${OCI_SEL_PROF:+ (tenancy ...${OCI_SEL_TEN: -12})}"
-if [ ${#CLOUD_SEL[@]} -gt 0 ]; then
+[ "$MODO" = "COMPLETA" ] && say "  OCI ...............: ${OCI_SEL_PROF:-nao sera coletado}${OCI_SEL_PROF:+ (tenancy ...${OCI_SEL_TEN: -12})}"
+if [ "$MODO" = "RESTORE" ]; then
+  :
+elif [ ${#CLOUD_SEL[@]} -gt 0 ]; then
   say "  Nuvem publica .....: ${#CLOUD_SEL[@]} alvo(s)"
   for c in "${CLOUD_SEL[@]}"; do
     IFS='|' read -r cp ci ce cr <<< "$c"
@@ -804,8 +877,12 @@ if [ ${#CLOUD_SEL[@]} -gt 0 ]; then
 else
   say "  Nuvem publica .....: nenhuma alem da OCI"
 fi
-say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
-say "  RPO / RTO .........: $RPO / $RTO"
+say "  Evid. restauracao .: $([ "$RST_ON" = "1" ] && echo "SIM${RST_DIRS:+ (extras: $RST_DIRS)}" || echo "NAO")"
+say "  Tempo previsto ....: ${TEMPO_PREVISTO:-nao definido}"
+if [ "$MODO" = "COMPLETA" ]; then
+  say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
+  say "  RPO / RTO .........: $RPO / $RTO"
+fi
 if [ ${#ALERTAS[@]} -gt 0 ]; then
   say "  ${AMAR}Alertas: ${#ALERTAS[@]}${R}"; for a in "${ALERTAS[@]}"; do info "  ! $a"; done
 fi
@@ -827,6 +904,7 @@ dl(){ local m="$1"; local dest="${TMP_DIGEST:-$TMP}"
   chmod +x "$dest/$m"; }
 
 cd "$WORK"
+if [ "$MODO" = "COMPLETA" ]; then
 if [ "$COLETA_LOCAL" = "1" ]; then
   if dl 01_coleta_linux_geral.sh; then
     if bash "$TMP/01_coleta_linux_geral.sh" ${DIR_SEL[@]+"${DIR_SEL[@]}"}; then ok "Inventario local coletado"; else erro "Modulo 01 falhou durante a coleta"; MODULOS_FALHARAM+=("01_coleta_linux_geral.sh(execucao)"); COLETA_INCOMPLETA=1; fi
@@ -888,6 +966,19 @@ if [ ${#CLOUD_SEL[@]} -gt 0 ]; then
     done
   fi
 fi
+fi # fim da coleta exclusiva do modo COMPLETA
+
+# Evidencias de teste de restauracao (Anexo I), nos dois modos
+if [ "$RST_ON" = "1" ]; then
+  info "Varrendo logs e scripts de clonagem (somente leitura)..."
+  if dl 09_coleta_evidencias_restore.sh; then
+    if WISEDB_CLONE_DIRS="$RST_DIRS" WISEDB_TEMPO_PREVISTO="$TEMPO_PREVISTO" bash "$TMP/09_coleta_evidencias_restore.sh"; then
+      ok "Evidencias de restauracao coletadas"
+    else
+      erro "Modulo 09 falhou durante a coleta"; MODULOS_FALHARAM+=("09_coleta_evidencias_restore.sh(execucao)"); COLETA_INCOMPLETA=1
+    fi
+  fi
+fi
 # Registro explicito do nivel de privilegio da coleta. Entra no resultado_final e
 # permite a quem le a politica saber se o cron de sistema foi de fato auditado.
 { echo "## NIVEL DE PRIVILEGIO DESTA COLETA"
@@ -914,10 +1005,11 @@ titulo "FASE 7 - SANITIZACAO E CONSOLIDACAO"
 find "$WORK" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.json" \) -print0 |
 while IFS= read -r -d '' f; do
   sed -i -E \
-    -e 's/((password|passwd|pwd|secret|token|apikey|api_key|client_secret)[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig' \
+    -e 's/((password|passwd|pwd|senha|secret|token|apikey|api_key|api_secret|client_secret)[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig' \
     -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
     -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' \
-    -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"']{3,}@#\1/***REMOVIDO***@#g' "$f"
+    -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"'*]{3,}@#\1/***REMOVIDO***@#g' \
+    -e 's/(-P[[:space:]]+)[^[:space:]]+/\1***REMOVIDO***/g' "$f"
 done
 TMP_DIGEST="$WORK/.digest"; mkdir -p "$TMP_DIGEST"
 [ -f "$TMP/wisedb_digest.py" ] && cp "$TMP/wisedb_digest.py" "$TMP_DIGEST/" 2>/dev/null
@@ -928,6 +1020,7 @@ FINAL="$WORK/resultado_final.txt"
   echo "================================================================"
   echo " WISEDB - COLETA AUTOMATICA v$VERSAO"
   echo " Cliente ............: $CLIENTE"
+  echo " Modo da coleta .....: $MODO"
   echo " Versao do script ...: $VERSAO"
   echo " Host da coleta .....: $FQDN (papel: $PAPEL)"
   echo " Coleta local .......: $([ "$COLETA_LOCAL" = "1" ] && echo "SIM - evidencia do cliente" || echo "NAO - host de ferramenta WiseDB")"
@@ -954,24 +1047,43 @@ FINAL="$WORK/resultado_final.txt"
   done
 } > "$FINAL"
 
+WISEDB_MODO_COLETA="$MODO" WISEDB_VERSAO="$VERSAO" \
 python3 - "$WORK" "$CLIENTE" "$PAPEL" "$COLETA_LOCAL" "$OCI_SEL_PROF" "$OCI_SEL_TEN" "$VM_TENANCY" "$RPO" "$RTO" "$MD_CONFIAVEL" <<'PYEOF' 2>/dev/null || warn "python3 ausente: resultado.json nao gerado (o .txt esta completo)"
 import json, os, sys, datetime
 w, cli, papel, local, prof, ten, vmten, rpo, rto, mdok = sys.argv[1:11]
+modo = os.environ.get("WISEDB_MODO_COLETA", "COMPLETA")
 pend = []
-if rpo.startswith("A combinar"): pend.append("RPO nao definido formalmente")
-if rto.startswith("A combinar"): pend.append("RTO nao definido formalmente")
+if modo == "COMPLETA":
+    if rpo.startswith("A combinar"): pend.append("RPO nao definido formalmente")
+    if rto.startswith("A combinar"): pend.append("RTO nao definido formalmente")
+    if not prof: pend.append("Coleta OCI nao executada nesta rodada")
 if local == "0": pend.append("Host de ferramenta: ambiente local do cliente deve ser coletado no servidor do cliente")
-if not prof: pend.append("Coleta OCI nao executada nesta rodada")
+rst = {"coletado": False}
+for r_, _, fs in os.walk(w):
+    if os.path.basename(r_) == "09_restore" and "execucoes_clone.tsv" in fs:
+        linhas = open(os.path.join(r_, "execucoes_clone.tsv"), encoding="utf-8", errors="replace").read().splitlines()[1:]
+        cols = [l.split("\t") for l in linhas if l.strip()]
+        por_met = {}
+        for c in cols:
+            if len(c) > 5: por_met[c[3]] = por_met.get(c[3], 0) + 1
+        validos = [c for c in cols if len(c) > 9 and c[4] == "SIM" and c[5] in ("SUCESSO", "SUCESSO_COM_ALERTAS")]
+        al = os.path.join(r_, "alertas.txt")
+        rst = {"coletado": True, "execucoes": len(cols), "por_metodo": por_met,
+               "testes_validos_com_sucesso": len(validos),
+               "alertas": [a for a in open(al, encoding="utf-8").read().splitlines() if a.strip()] if os.path.exists(al) else []}
+        if not validos: pend.append("Sem teste de restauracao a partir de backup com sucesso no periodo analisado")
+        break
 if vmten and ten and vmten != ten and mdok == "1": pend.append("Tenancy da VM difere da do profile: escopo validado manualmente")
 if os.environ.get("WISEDB_SSL_FALLBACK_USED") == "1": pend.append("TLS do GitHub exigiu fallback -k; recomenda-se corrigir a cadeia de CA do sistema")
 if os.environ.get("WISEDB_COLETA_INCOMPLETA") == "1": pend.append("Coleta incompleta: um ou mais modulos/evidencias falharam")
 doc = {
  "schema": "wisedb.coleta.backup/v2",
  "cliente": cli,
- "coleta": {"host": os.uname().nodename, "papel_host": papel,
+ "coleta": {"host": os.uname().nodename, "papel_host": papel, "modo": modo,
             "coleta_local_habilitada": local == "1",
             "data": datetime.datetime.now().isoformat(timespec="minutes"),
-            "script_versao": "3.3"},
+            "script_versao": os.environ.get("WISEDB_VERSAO", "?")},
+ "evidencias_restore": rst,
  "oci": {"profile_usado": prof or None, "tenancy_profile": ten or None,
          "tenancy_reportada_pelo_metadata": vmten or None,
          "metadata_confiavel": mdok == "1",
@@ -987,7 +1099,22 @@ PYEOF
 
 # ---- RESUMO COMPACTO (o que voce cola na IA) -------------------------------
 RESUMO="$WORK/RESUMO_${CLIENTE// /_}_${HOSTN}.txt"
-if dl wisedb_digest.py 2>/dev/null; then
+if [ "$MODO" = "RESTORE" ]; then
+  # Modo evidencias: o RESUMO e o proprio Anexo I gerado pelo modulo 09, sem digest.
+  RESUMO="$WORK/RESUMO_RESTORE_${CLIENTE// /_}_${HOSTN}.txt"
+  AX=$(find "$WORK" -path '*09_restore/anexo_I_evidencias.txt' 2>/dev/null | head -1)
+  if [ -n "$AX" ]; then
+    { echo "######################################################################"
+      echo "# RESUMO WISEDB - EVIDENCIAS DE RESTAURACAO - $CLIENTE"
+      echo "# Host: $FQDN | Papel: $PAPEL | Coleta: $(date '+%d/%m/%Y %H:%M') | kit v$VERSAO"
+      echo "# Uso: complementar o Anexo I (Registro de testes) de politica ja emitida"
+      echo "######################################################################"
+      cat "$AX"
+    } > "$RESUMO"
+  else
+    warn "Anexo I nao gerado pelo modulo 09; verifique $WORK"
+  fi
+elif dl wisedb_digest.py 2>/dev/null; then
   python3 "$TMP_DIGEST/wisedb_digest.py" "$WORK" "$CLIENTE" "$PAPEL" "$RESUMO" \
     || warn "Digest nao gerado; use o resultado_final.txt"
   # o digest v2.1 resolve sozinho a subpasta coleta_<host>_<data>; se ainda assim
@@ -1006,7 +1133,7 @@ info "Segredos remanescentes:"
 grep -rniE 'password|passwd|secret|token' "$WORK" 2>/dev/null | grep -v 'REMOVIDO' | head -5 || info "  nenhum"
 pergunta "Gerar pacote final? (S/n)" OKF "S"
 if [ "${OKF^^}" != "N" ]; then
-  PAC="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}.tar.gz"
+  PAC="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}${SUF_MODO}.tar.gz"
   tar -czf "$PAC" -C "$ORIG_DIR" "$(basename "$WORK")"
   say ""
   if [ "$COLETA_INCOMPLETA" = "1" ]; then
