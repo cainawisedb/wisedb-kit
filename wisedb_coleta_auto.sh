@@ -20,6 +20,11 @@
 #
 # RISCO: Zero no ambiente. Somente leitura.
 #
+# v3.6.1 (setembro/2026)
+#   [CORRIGIDO] Modulo 09 v1.2: leitura robusta do sqlplus (12c devolvia o texto
+#               do SELECT como resultado), varredura sem travamento com tempo
+#               limite e progresso, e /WiseDb em qualquer grafia.
+#
 # v3.6 (setembro/2026)
 #   [NOVO]      Modulo 09 v1.1: descobre sozinho as rotinas de clone/restore
 #               (cron completo e scripts chamados, varredura por conteudo em
@@ -101,7 +106,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.6"
+VERSAO="3.6.1"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -533,7 +538,7 @@ fi
 fi # fim do bloco exclusivo do modo COMPLETA
 
 # Previa das evidencias de clonagem (a varredura completa e feita pelo modulo 09)
-RST_PREVIA=$(for d in /wisedb/scripts/logs /wisedb/scripts/clone /wisedb/scripts /wisedb /home/oracle; do
+RST_PREVIA=$(for d in $(find / -maxdepth 1 -type d -iname '*wisedb*' 2>/dev/null) /home/oracle; do
                [ -d "$d" ] && find "$d" -maxdepth 4 -type f \( -iname '*clon*' -o -iname '*duplic*' -o -iname '*refresh*' \) \
                  -mtime -"${WISEDB_CLONE_DAYS:-365}" 2>/dev/null
              done | sort -u | wc -l)
@@ -849,8 +854,8 @@ fi # fim do escopo exclusivo do modo COMPLETA
 RST_DIRS=""; RST_ON=0
 if [ "$COLETA_LOCAL" = "1" ]; then
   RST_ON=1
-  info "Evidencias de restauracao: varredura de /wisedb/scripts/logs, /wisedb/scripts/clone, /wisedb,"
-  info "/home/oracle e dos diretorios citados no cron (arquivos Clone*/duplicate/refresh e logs de DUPLICATE)."
+  info "Evidencias de restauracao: descoberta automatica (cron e scripts chamados, /WiseDb em qualquer grafia,"
+  info "/home, /u0*, /backup*, /opt, mounts de dados e v\$rman_status dos bancos). Pode levar alguns minutos."
   pergunta "Diretorios EXTRAS com logs de clonagem (separados por ':', ENTER p/ nenhum)" RST_DIRS ""
 else
   info "Evidencias de restauracao nao coletadas neste host (estacao de coleta)"

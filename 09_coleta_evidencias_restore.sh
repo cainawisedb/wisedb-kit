@@ -44,6 +44,19 @@
 #              alertas.txt | varredura.txt | cron_clone.txt | descartados.txt
 #              scripts_clone/ | extratos/
 #
+# Versao 1.2 (setembro/2026)
+#   [CORRIGIDO] Em instancia 12c o sqlplus devolvia o proprio texto do SELECT
+#               junto com o erro, e o texto era lido como sessao RMAN. Toda
+#               linha de resultado agora sai com prefixo (I#, S#, J#, O#, T#) e
+#               so linha com prefixo e aproveitada; erros vao para sql_erros.txt.
+#               LISTAGG removido (ORA-01489 em sessoes com muitos comandos).
+#   [CORRIGIDO] Varredura travava em servidores com muitos arquivos: o filtro por
+#               conteudo passa a ser um unico grep via xargs por raiz, com
+#               tempo limite (WISEDB_CLONE_TIMEOUT, padrao 180 s por raiz) e
+#               progresso na tela.
+#   [CORRIGIDO] Pastas WiseDB com qualquer grafia (/WiseDb, /wisedb, /WISEDB)
+#               sao descobertas na raiz do sistema.
+#
 # Versao 1.1 (setembro/2026)
 #   [NOVO]      Descoberta automatica: cron completo + scripts chamados + logs
 #               citados, varredura por conteudo e controlfile (v$rman_status).
@@ -75,7 +88,10 @@ SUDO=""
 if [ "${WISEDB_SUDO:-0}" = "1" ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
   SUDO="sudo -n"
 fi
-TOUT=""; command -v timeout >/dev/null 2>&1 && TOUT="timeout 120"
+TOUT=""; command -v timeout >/dev/null 2>&1 && TOUT="timeout 60"
+TLIM="${WISEDB_CLONE_TIMEOUT:-180}"
+TVAR=""; command -v timeout >/dev/null 2>&1 && TVAR="timeout $TLIM"
+prog(){ echo "  ... $*" >&2; }
 
 rd(){ if [ -r "$1" ]; then cat "$1" 2>/dev/null; elif [ -n "$SUDO" ]; then $SUDO cat "$1" 2>/dev/null; fi; }
 existe(){ [ -e "$1" ] || { [ -n "$SUDO" ] && $SUDO test -e "$1" 2>/dev/null; }; }
@@ -147,7 +163,10 @@ done < "$TMPD/cron_all"
 mask < "$OUT/cron_clone.txt" > "$TMPD/cc" && mv "$TMPD/cc" "$OUT/cron_clone.txt"
 
 #---------------------------- 2/3. varredura de arquivos -----------------------
-declare -a DIRS=(/wisedb /home /u01 /u02 /u03 /u04 /u05 /backup /bkp /orabackup /oracle
+# Pastas WiseDB em qualquer grafia na raiz (/WiseDb, /wisedb, /WISEDB...)
+declare -a WDIRS=()
+mapfile -t WDIRS < <(find / -maxdepth 1 -type d -iname '*wisedb*' 2>/dev/null)
+declare -a DIRS=(${WDIRS[@]+"${WDIRS[@]}"} /wisedb /home /u01 /u02 /u03 /u04 /u05 /backup /bkp /orabackup /oracle
                  /scripts /dba /opt /dados "$HOME")
 while read -r mp tp; do
   case "$tp" in ext2|ext3|ext4|xfs|btrfs|nfs|nfs4|ocfs2|acfs|cifs|vxfs) ;; *) continue;; esac
@@ -183,45 +202,51 @@ for d in ${DIRS_OK[@]+"${DIRS_OK[@]}"}; do
   [ "$dentro" = "0" ] && RAIZES+=("$d")
 done
 
-# find com poda das areas de banco/binarios (diag, product, oradata, FRA...)
+# 1) find lista os candidatos (poda de areas de banco/binarios) com limite de
+#    tempo; 2) um unico grep por raiz filtra pelo CONTEUDO. Evita abrir arquivo
+#    por arquivo em shell, que travava servidores com muitos logs.
 PODA=( \( -path '*/diag' -o -path '*/product' -o -path '*/oradata' -o -path '*/fast_recovery_area'
           -o -path '*/flash_recovery_area' -o -path '*/oraInventory' -o -path '*/adump' -o -path '*/audit'
           -o -path '*/cfgtoollogs' -o -path '*/.cache' -o -path '*/.config' -o -path '*/.local' -o -path '*/.git'
-          -o -path '*/checkpoints' -o -path '*/lost+found' -o -path '*/grid' -o -path '/proc' \) -prune )
-: > "$TMPD/cand"
+          -o -path '*/checkpoints' -o -path '*/lost+found' -o -path '*/grid' -o -ipath '*protheus_data*'
+          -o -ipath '*/totvs*/bin' -o -path '/proc' \) -prune )
+: > "$TMPD/logs"; : > "$TMPD/scripts"; : > "$OUT/descartados.txt"; : > "$TMPD/timeout"
 for r in ${RAIZES[@]+"${RAIZES[@]}"}; do
-  $TOUT $SUDO find "$r" -maxdepth "$DEPTH" "${PODA[@]}" -o -type f -mtime -"$DIAS" -size -50M \
-    \( -iname '*clon*' -o -iname '*duplic*' -o -iname '*refresh*' -o -iname '*restore*' \
-       -o -iname '*.log' -o -iname '*.out' -o -iname '*.lst' -o -iname '*.txt' \
-       -o -iname '*.sh' -o -iname '*.ksh' -o -iname '*.rman' -o -iname '*.rcv' -o -iname '*.sql' -o -iname '*.par' \) \
-    -print 2>/dev/null
-done | grep -vE "$NOME_OUT" | sort -u > "$TMPD/cand"
-for s in "${!ROT[@]}"; do echo "$s"; done >> "$TMPD/cand"
-sort -u -o "$TMPD/cand" "$TMPD/cand"
+  prog "varrendo $r"
+  : > "$TMPD/l_log"; : > "$TMPD/l_scr"
+  $TVAR $SUDO find "$r" -maxdepth "$DEPTH" "${PODA[@]}" -o -type f -mtime -"$DIAS" -size -50M \
+    \( -iname '*.log' -o -iname '*.out' -o -iname '*.lst' -o -iname '*.txt' \
+       -o -iname '*clon*' -o -iname '*duplic*' -o -iname '*refresh*' -o -iname '*restore*' \) -print 2>/dev/null \
+    | grep -vE "$NOME_OUT" | tr '\n' '\0' > "$TMPD/l_log"
+  [ "${PIPESTATUS[0]}" = "124" ] && echo "$r (find de logs)" >> "$TMPD/timeout"
+  $TVAR $SUDO find "$r" -maxdepth "$DEPTH" "${PODA[@]}" -o -type f -mtime -"$DIAS" -size -5M \
+    \( -iname '*.sh' -o -iname '*.ksh' -o -iname '*.bash' -o -iname '*.rman' -o -iname '*.rcv' -o -iname '*.sql' -o -iname '*.par' \) -print 2>/dev/null \
+    | grep -vE "$NOME_OUT" | tr '\n' '\0' > "$TMPD/l_scr"
+  [ "${PIPESTATUS[0]}" = "124" ] && echo "$r (find de scripts)" >> "$TMPD/timeout"
+  $TVAR xargs -0 -r $SUDO grep -lIiE "$LOG_RX" < "$TMPD/l_log" 2>/dev/null >> "$TMPD/hit_log"
+  [ $? = 124 ] && echo "$r (grep de logs)" >> "$TMPD/timeout"
+  $TVAR xargs -0 -r $SUDO grep -lIiE "$SCR_RX" < "$TMPD/l_scr" 2>/dev/null >> "$TMPD/hit_scr"
+  [ $? = 124 ] && echo "$r (grep de scripts)" >> "$TMPD/timeout"
+  # nomes que sugerem clone mas nao tem comando/saida de clone (transparencia)
+  tr '\0' '\n' < "$TMPD/l_log" | grep -iE '/[^/]*(clon|duplic|refresh)[^/]*$' >> "$TMPD/nome_suspeito"
+done
+touch "$TMPD/hit_log" "$TMPD/hit_scr" "$TMPD/nome_suspeito"
+for s in "${!ROT[@]}"; do echo "$s"; done >> "$TMPD/hit_scr"
+sort -u -o "$TMPD/hit_log" "$TMPD/hit_log"; sort -u -o "$TMPD/hit_scr" "$TMPD/hit_scr"
+sort -u "$TMPD/nome_suspeito" | grep -vxF -f "$TMPD/hit_log" | sed 's/$/ (nome sugere clone, mas sem saida de DUPLICATE\/RESTORE\/impdp)/' > "$OUT/descartados.txt"
 
-# Filtro por CONTEUDO: so fica o que tem comando/saida de clone ou restore
-: > "$TMPD/logs"; : > "$TMPD/scripts"; : > "$OUT/descartados.txt"
 while read -r f; do
   [ -z "$f" ] && continue
-  st=$( { stat -c '%Y|%s|%U' "$f" 2>/dev/null || $SUDO stat -c '%Y|%s|%U' "$f" 2>/dev/null; } )
-  [ -z "$st" ] && continue
-  if eh_script "$f"; then
-    if rd "$f" | grep -qiE "$SCR_RX"; then
-      echo "$st|$f" >> "$TMPD/scripts"
-      [ -z "${ROT[$f]+x}" ] && ROT[$f]="varredura por conteudo"
-    elif echo "$f" | grep -qiE 'clon|duplic|refresh'; then
-      echo "$f (nome sugere clone, mas sem comando DUPLICATE/RESTORE/impdp)" >> "$OUT/descartados.txt"
-    fi
-  else
-    rd "$f" | head -c 65536 | grep -qI . || continue
-    if rd "$f" | grep -qiE "$LOG_RX"; then
-      if rd "$f" | grep -qiE "$TIER1_RX"; then echo "1|$st|$f" >> "$TMPD/logs"
-      else echo "2|$st|$f" >> "$TMPD/logs"; fi
-    elif echo "$f" | grep -qiE 'clon|duplic|refresh'; then
-      echo "$f (nome sugere clone, mas sem saida de DUPLICATE/RESTORE/impdp)" >> "$OUT/descartados.txt"
-    fi
-  fi
-done < "$TMPD/cand"
+  st=$( { stat -c '%Y|%s|%U' "$f" 2>/dev/null || $SUDO stat -c '%Y|%s|%U' "$f" 2>/dev/null; } ) || continue
+  echo "$st|$f" >> "$TMPD/scripts"
+  [ -z "${ROT[$f]+x}" ] && ROT[$f]="varredura por conteudo"
+done < "$TMPD/hit_scr"
+prog "classificando $(grep -c . "$TMPD/hit_log") log(s) e $(grep -c . "$TMPD/hit_scr") script(s) com comando de clone/restore"
+while read -r f; do
+  [ -z "$f" ] && continue
+  st=$( { stat -c '%Y|%s|%U' "$f" 2>/dev/null || $SUDO stat -c '%Y|%s|%U' "$f" 2>/dev/null; } ) || continue
+  if rd "$f" | grep -qiE "$TIER1_RX"; then echo "1|$st|$f" >> "$TMPD/logs"; else echo "2|$st|$f" >> "$TMPD/logs"; fi
+done < "$TMPD/hit_log"
 # Tier 1 (clone/import/restore) primeiro; RESTORE VALIDATE limitado aos 5 mais novos
 { grep '^1|' "$TMPD/logs" | cut -d'|' -f2- | sort -t'|' -k1,1nr | head -"$MAXF"
   grep '^2|' "$TMPD/logs" | cut -d'|' -f2- | sort -t'|' -k1,1nr | head -5; } > "$TMPD/logs_ord"
@@ -310,9 +335,10 @@ declare -a SIDS_OK=()
 for sid in ${SIDS[@]+"${SIDS[@]}"}; do
   home=$(home_de "$sid")
   if [ -z "$home" ] || [ ! -x "$home/bin/sqlplus" ]; then echo "$sid | ORACLE_HOME nao encontrado no oratab" >> "$OUT/bancos_locais.txt"; continue; fi
-  inv=$(sqlq "$sid" "$home" <<SQL_EOF | grep '|' | head -1
+  prog "consultando controlfile de $sid"
+  inv=$(sqlq "$sid" "$home" <<SQL_EOF | grep '^I#' | sed 's/^I#//' | head -1
 set heading off feedback off pagesize 0 linesize 400 trimspool on
-select d.name||'|'||d.dbid||'|'||to_char(d.created,'YYYY-MM-DD HH24:MI:SS')||'|'||to_char(d.resetlogs_time,'YYYY-MM-DD HH24:MI:SS')||'|'||d.log_mode||'|'||d.open_mode||'|'||d.database_role||'|'||(select count(*) from v\$database_incarnation) from v\$database d;
+select 'I#'||d.name||'|'||d.dbid||'|'||to_char(d.created,'YYYY-MM-DD HH24:MI:SS')||'|'||to_char(d.resetlogs_time,'YYYY-MM-DD HH24:MI:SS')||'|'||d.log_mode||'|'||d.open_mode||'|'||d.database_role||'|'||(select count(*) from v\$database_incarnation) from v\$database d;
 exit
 SQL_EOF
 )
@@ -322,13 +348,14 @@ SQL_EOF
   echo "$sid|$inv" >> "$TMPD/inv"
 
   # Sessoes RMAN de RESTORE/DUPLICATE registradas no controlfile
-  sqlq "$sid" "$home" <<SQL_EOF | grep '|' | sed "s/^/$sid|/" >> "$TMPD/rman_sessoes"
+  sqlq "$sid" "$home" <<SQL_EOF | tee -a "$TMPD/sqlout_$sid" | grep '^S#' | sed "s/^S#/$sid|/" >> "$TMPD/rman_sessoes"
 set heading off feedback off pagesize 0 linesize 1000 trimspool on
-select s.session_recid||'|'||s.session_stamp||'|'||to_char(min(s.start_time),'YYYY-MM-DD HH24:MI:SS')||'|'||
+select 'S#'||s.session_recid||'|'||s.session_stamp||'|'||to_char(min(s.start_time),'YYYY-MM-DD HH24:MI:SS')||'|'||
        to_char(max(s.end_time),'YYYY-MM-DD HH24:MI:SS')||'|'||
        max(case when s.status like 'FAILED%' then 3 when s.status like '%ERRORS%' then 2
                 when s.status like 'RUNNING%' then 4 when s.status like '%WARNING%' then 1 else 0 end)||'|'||
-       substr(listagg(s.operation||' '||s.object_type, ', ') within group (order by s.start_time),1,300)
+       min(s.operation)||decode(min(s.operation),max(s.operation),'',' / '||max(s.operation))||' '||
+       nvl(max(s.object_type),'-')||' ('||count(*)||' comando(s))' 
 from v\$rman_status s
 where s.row_level = 1 and s.start_time > sysdate - $DIAS
   and (s.operation like 'RESTORE%' or s.operation like 'DUPLICATE%')
@@ -338,12 +365,19 @@ exit
 SQL_EOF
 
   # Jobs de backup (35 dias) para o RPO observado e referencia de RTO
-  sqlq "$sid" "$home" <<SQL_EOF | grep '|' | sed "s/^/$sid|/" >> "$TMPD/bkjobs"
+  sqlq "$sid" "$home" <<SQL_EOF | tee -a "$TMPD/sqlout_$sid" | grep '^J#' | sed "s/^J#/$sid|/" >> "$TMPD/bkjobs"
 set heading off feedback off pagesize 0 linesize 400 trimspool on
-select input_type||'|'||status||'|'||to_char(start_time,'YYYY-MM-DD HH24:MI:SS')||'|'||to_char(end_time,'YYYY-MM-DD HH24:MI:SS')||'|'||elapsed_seconds
+select 'J#'||input_type||'|'||status||'|'||to_char(start_time,'YYYY-MM-DD HH24:MI:SS')||'|'||to_char(end_time,'YYYY-MM-DD HH24:MI:SS')||'|'||elapsed_seconds
 from v\$rman_backup_job_details where start_time > sysdate - 35 order by end_time;
 exit
 SQL_EOF
+done
+
+# Erros de SQL (ORA-/SP2-) por instancia, para diagnostico
+for f in "$TMPD"/sqlout_*; do
+  [ -f "$f" ] || continue
+  e=$(grep -E 'ORA-[0-9]{5}|SP2-[0-9]{4}' "$f" | sort -u | head -10)
+  [ -n "$e" ] && { echo "## ${f##*/sqlout_}"; echo "$e"; } >> "$OUT/sql_erros.txt"
 done
 
 # Uma pseudo-evidencia por sessao RMAN, com a saida de v$rman_output quando
@@ -351,14 +385,14 @@ done
 : > "$TMPD/sessoes_ord"
 n=0
 while IFS='|' read -r sid srecid sstamp ini fim sev ops; do
-  [ -z "$srecid" ] && continue
+  [[ "$srecid" =~ ^[0-9]+$ ]] && [[ "$sstamp" =~ ^[0-9]+$ ]] || continue
   n=$((n+1)); [ "$n" -gt 60 ] && break
   home=$(home_de "$sid"); pl="$TMPD/sess_${sid}_${srecid}.log"
   { echo "## FONTE: controlfile de $sid (v\$rman_status sessao $srecid) | operacoes: $ops"
     echo "Starting session at $ini"
-    sqlq "$sid" "$home" <<SQL_EOF | grep -v '^[[:space:]]*$' | head -400
+    sqlq "$sid" "$home" <<SQL_EOF | grep '^O#' | sed 's/^O#//' | head -400
 set heading off feedback off pagesize 0 linesize 400 trimspool on
-select output from v\$rman_output where session_recid = $srecid and session_stamp = $sstamp order by recid;
+select 'O#'||output from v\$rman_output where session_recid = $srecid and session_stamp = $sstamp order by recid;
 exit
 SQL_EOF
     [ -n "$fim" ] && echo "Finished session at $fim"
@@ -376,9 +410,9 @@ tam_db(){
   [ -z "$sid" ] && sid=$(awk -F'|' -v n="$n" 'toupper($2)==toupper(n){print $1; exit}' "$TMPD/inv" 2>/dev/null)
   if [ -n "$sid" ]; then
     home=$(home_de "$sid")
-    r=$(sqlq "$sid" "$home" <<'SQL_EOF' | grep -E '^[[:space:]]*[0-9.,]+[[:space:]]*$' | head -1 | tr -d ' '
+    r=$(sqlq "$sid" "$home" <<'SQL_EOF' | grep '^T#' | sed 's/^T#//' | head -1 | tr -d ' '
 set heading off feedback off pagesize 0 linesize 200
-select sum(bytes)/1024/1024/1024 from v$datafile;
+select 'T#'||sum(bytes)/1024/1024/1024 from v$datafile;
 exit
 SQL_EOF
 )
@@ -549,7 +583,9 @@ while IFS='|' read -r sid srecid ini fim sev ops pl; do
   nm=$(awk -F'|' -v s="$sid" '$1==s{print $2; exit}' "$TMPD/inv")
   FORCE_DST="${nm:-$sid}"; FORCE_ORI="${nm:-$sid}"; FORCE_CF=1
   # Sem saida em memoria, o tipo vem da propria operacao registrada
-  if [ "$(grep -vc '^\(##\|Starting session\|Finished session\)' "$pl")" -eq 0 ]; then
+  [ -f "$pl" ] || continue
+  nlin=$(grep -vc '^\(##\|Starting session\|Finished session\)' "$pl" 2>/dev/null); nlin=${nlin:-0}
+  if [ "$nlin" -eq 0 ]; then
     case "$ops" in *VALIDATE*) echo "RESTORE VALIDATE" >> "$pl";; *DUPLICATE*) echo "Duplicate Db (sem saida em v\$rman_output)" >> "$pl";; *) echo "restore database (registro de controlfile: $ops)" >> "$pl";; esac
   fi
   e_fim=$(to_epoch "$fim"); [ -z "$e_fim" ] && e_fim=$(to_epoch "$ini")
@@ -651,6 +687,8 @@ if [ -n "$ULT_OK" ]; then
   ult_ep=$(to_epoch "$(echo "$ULT_OK" | cut -d'|' -f1 | xargs)")
   [ -n "$ult_ep" ] && [ $(( (AGORA-ult_ep)/86400 )) -gt 90 ] && al "Ultimo teste de restauracao com sucesso tem mais de 90 dias ($(echo "$ULT_OK" | cut -d'|' -f1 | xargs))"
 fi
+[ -s "$TMPD/timeout" ] && al "Varredura interrompida por tempo limite (${TLIM}s) em: $(paste -sd';' "$TMPD/timeout"). Reexecutar com WISEDB_CLONE_TIMEOUT maior ou informar o diretorio de logs como extra"
+[ -s "$OUT/sql_erros.txt" ] && al "Erros ao consultar o controlfile de algumas instancias (ver sql_erros.txt): evidencias de restore dessas instancias podem estar incompletas"
 al "RPO e RTO acordados: A DEFINIR com o cliente; valores observados no ambiente em rpo_rto_observado.txt"
 grep -iE 'secret_access_key|aws_secret|password[[:space:]]*=' -l $(sort -u "$TMPD/scripts" | cut -d'|' -f4) 2>/dev/null | head -3 | while read -r f; do
   al "Credencial em texto claro em script de clone: $f (valor mascarado na coleta)"
@@ -665,6 +703,7 @@ done
   echo "Logs de clone/restore: $NLOGS_T1 | logs de RESTORE VALIDATE: $NLOGS_T2 | analisados: $NLOGS"
   while IFS='|' read -r mt sz dono f; do echo "  $(fmt "$mt") | $sz bytes | $dono | $f"; done < "$TMPD/logs_ord"
   echo "Rotinas (scripts): $NSCR (ver rotinas_descobertas.txt)"
+  [ -s "$TMPD/timeout" ] && { echo "Raizes com tempo limite estourado (${TLIM}s):"; sed 's/^/  - /' "$TMPD/timeout"; }
   echo "Descartados por conteudo: $(grep -c . "$OUT/descartados.txt") (ver descartados.txt)"
 } > "$OUT/varredura.txt"
 
