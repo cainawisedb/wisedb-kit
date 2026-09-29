@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
-# v3.5 - Wizard blindado + multicloud + evidencias de teste de restauracao
+# v3.6 - Wizard blindado + multicloud + evidencias de restauracao com descoberta automatica
 #
 # USO:
 #   export WISEDB_BASE_URL="https://raw.githubusercontent.com/SUAORG/wisedb-kit/main"
@@ -19,6 +19,17 @@
 #   tenancy escolhida entra como evidencia do cliente.
 #
 # RISCO: Zero no ambiente. Somente leitura.
+#
+# v3.6 (setembro/2026)
+#   [NOVO]      Modulo 09 v1.1: descobre sozinho as rotinas de clone/restore
+#               (cron completo e scripts chamados, varredura por conteudo em
+#               /wisedb, /home, /u0*, /backup*, /opt e mounts de dados, e
+#               v$rman_status/v$rman_output de cada banco local).
+#   [ALTERADO]  RPO e RTO deixam de ser perguntados: o acordado fica A DEFINIR,
+#               sem default, e o observado no ambiente (intervalo real entre
+#               backups e duracao real das restauracoes) vai para Observacoes.
+#   [CORRIGIDO] Falso positivo rclone.conf como script de clone e mascara de
+#               chaves (access_key_id e afins) na FASE 7.
 #
 # v3.5 (setembro/2026)
 #   [NOVO]      FASE 0 - MODO DA COLETA. Duas opcoes no wizard:
@@ -90,7 +101,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.5"
+VERSAO="3.6"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -619,15 +630,10 @@ if [ "$COERENTE" = "0" ]; then
     warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
   fi
 fi
-TEMPO_PREVISTO=""
-if [ "$MODO" = "COMPLETA" ]; then
-  pergunta "RPO acordado (ENTER se nao definido)" RPO "A combinar com o cliente"
-  pergunta "RTO acordado (ENTER se nao definido)" RTO "A combinar com o cliente"
-  case "$RTO" in "A combinar"*) ;; *) TEMPO_PREVISTO="$RTO";; esac
-else
-  RPO="Nao coletado (modo evidencias)"; RTO="Nao coletado (modo evidencias)"
-  pergunta "Tempo previsto de restauracao da politica (ex.: 4h, 90min, 04:30; ENTER se nao definido)" TEMPO_PREVISTO ""
-fi
+# RPO/RTO sem valor default: o acordado fica A DEFINIR e o observado no
+# ambiente e calculado pelo modulo 09 (rpo_rto_observado.txt).
+RPO="A DEFINIR (observado: ver 09_restore/rpo_rto_observado.txt)"
+RTO="A DEFINIR (observado: ver 09_restore/rpo_rto_observado.txt)"
 
 #-------------------------------------------------------------------------------
 # Pasta de trabalho definitiva: cliente + host + data + hora.
@@ -878,11 +884,8 @@ else
   say "  Nuvem publica .....: nenhuma alem da OCI"
 fi
 say "  Evid. restauracao .: $([ "$RST_ON" = "1" ] && echo "SIM${RST_DIRS:+ (extras: $RST_DIRS)}" || echo "NAO")"
-say "  Tempo previsto ....: ${TEMPO_PREVISTO:-nao definido}"
-if [ "$MODO" = "COMPLETA" ]; then
-  say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
-  say "  RPO / RTO .........: $RPO / $RTO"
-fi
+say "  RPO / RTO .........: A DEFINIR (valores observados medidos no ambiente)"
+[ "$MODO" = "COMPLETA" ] && say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
 if [ ${#ALERTAS[@]} -gt 0 ]; then
   say "  ${AMAR}Alertas: ${#ALERTAS[@]}${R}"; for a in "${ALERTAS[@]}"; do info "  ! $a"; done
 fi
@@ -972,7 +975,7 @@ fi # fim da coleta exclusiva do modo COMPLETA
 if [ "$RST_ON" = "1" ]; then
   info "Varrendo logs e scripts de clonagem (somente leitura)..."
   if dl 09_coleta_evidencias_restore.sh; then
-    if WISEDB_CLONE_DIRS="$RST_DIRS" WISEDB_TEMPO_PREVISTO="$TEMPO_PREVISTO" bash "$TMP/09_coleta_evidencias_restore.sh"; then
+    if WISEDB_CLONE_DIRS="$RST_DIRS" WISEDB_ORA_SIDS="${ORA_SEL[*]:-}" bash "$TMP/09_coleta_evidencias_restore.sh"; then
       ok "Evidencias de restauracao coletadas"
     else
       erro "Modulo 09 falhou durante a coleta"; MODULOS_FALHARAM+=("09_coleta_evidencias_restore.sh(execucao)"); COLETA_INCOMPLETA=1
@@ -1005,7 +1008,7 @@ titulo "FASE 7 - SANITIZACAO E CONSOLIDACAO"
 find "$WORK" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.json" \) -print0 |
 while IFS= read -r -d '' f; do
   sed -i -E \
-    -e 's/((password|passwd|pwd|senha|secret|token|apikey|api_key|api_secret|client_secret)[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig' \
+    -e 's/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|key|key_id|keyid))[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig' \
     -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
     -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' \
     -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"'*]{3,}@#\1/***REMOVIDO***@#g' \
@@ -1028,8 +1031,8 @@ FINAL="$WORK/resultado_final.txt"
   echo " Profile OCI usado ..: ${OCI_SEL_PROF:-nenhum} | tenancy ${OCI_SEL_TEN:-n/a} | regiao ${OCI_SEL_REG:-n/a}"
   echo " Oracle no escopo ...: ${ORA_SEL[*]:-nenhum}"
   echo " Data da coleta .....: $(date '+%d/%m/%Y %H:%M %Z')"
-  echo " RPO informado ......: $RPO"
-  echo " RTO informado ......: $RTO"
+  echo " RPO acordado .......: $RPO"
+  echo " RTO acordado .......: $RTO"
   echo " Fora do escopo .....:"
   if [ ${#EXCL[@]} -eq 0 ]; then echo "   (nenhum)"; else
     for e in "${EXCL[@]}"; do echo "   - ${e%%|*} | Justificativa: ${e##*|}"; done; fi
@@ -1053,10 +1056,8 @@ import json, os, sys, datetime
 w, cli, papel, local, prof, ten, vmten, rpo, rto, mdok = sys.argv[1:11]
 modo = os.environ.get("WISEDB_MODO_COLETA", "COMPLETA")
 pend = []
-if modo == "COMPLETA":
-    if rpo.startswith("A combinar"): pend.append("RPO nao definido formalmente")
-    if rto.startswith("A combinar"): pend.append("RTO nao definido formalmente")
-    if not prof: pend.append("Coleta OCI nao executada nesta rodada")
+pend.append("RPO e RTO A DEFINIR com o cliente (valores observados em 09_restore/rpo_rto_observado.txt)")
+if modo == "COMPLETA" and not prof: pend.append("Coleta OCI nao executada nesta rodada")
 if local == "0": pend.append("Host de ferramenta: ambiente local do cliente deve ser coletado no servidor do cliente")
 rst = {"coletado": False}
 for r_, _, fs in os.walk(w):

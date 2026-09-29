@@ -10,6 +10,9 @@ Os arquivos brutos completos permanecem no pacote .tar.gz.
 Uso: python3 wisedb_digest.py <pasta_coleta> <cliente> <papel_host> [saida]
 Compativel com Python 3.6+ (sem f-strings aninhadas).
 
+Versao 2.3 (setembro/2026)
+  [ALTERADO]  RPO/RTO acordados: A DEFINIR; observado vem do modulo 09.
+
 Versao 2.2 (setembro/2026)
   [NOVO]      Secao EVIDENCIAS DE RESTAURACAO (Anexo I), lida do modulo 09
               (09_restore/anexo_I_evidencias.txt). Alertas do modulo 09 entram
@@ -810,7 +813,7 @@ else:
     add("  (nenhum alerta automatico gerado)")
 
 sec("PENDENCIAS DE ESCOPO")
-add("  - RPO/RTO acordados: verificar no cabecalho do resultado_final.txt")
+add("  - RPO/RTO acordados: A DEFINIR (sem default); valores observados na secao EVIDENCIAS DE RESTAURACAO")
 if RST_OK:
     add("  - Teste de restauracao: ver secao EVIDENCIAS DE RESTAURACAO; campos [A PREENCHER] nao inventar")
 else:

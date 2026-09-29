@@ -48,7 +48,8 @@ Todos os scripts são **somente leitura** e seguros para produção. Nenhum dele
 | 7a | `07_coleta_hypervisor_windows.ps1` | Host Hyper-V ou máquina com PowerCLI | Inventário de VMs Hyper-V/VMware + snapshots antigos, para cruzar com os jobs e achar VMs sem proteção |
 | 7b | `07_coleta_hypervisor_linux.sh` | Host Proxmox/PBS/KVM (root) | Jobs vzdump, retenção (prune), verify/sync do PBS, VMs sem backup, snapshots libvirt |
 | 8 | `08_coleta_cloud_outras.sh` | Servidor central com az/aws CLI | Se houver VMs em Azure (Recovery Services Vault) ou AWS (AWS Backup, EBS snapshots, DLM) |
-| 9 | `99_sanitizar_e_empacotar.sh` | Onde estiver a pasta de coleta | Sempre, antes de enviar |
+| 9 | `09_coleta_evidencias_restore.sh` | Servidor onde a clonagem executa (usuário `oracle`) | Evidências de teste de restauração (Anexo I) com descoberta automática: cron e scripts chamados, varredura por conteúdo e `v$rman_status` dos bancos locais. Classifica BACKUP_RMAN x ACTIVE_DATABASE x DATAPUMP x SQLSERVER x RESTORE_VALIDATE. RPO/RTO acordados ficam A DEFINIR; os observados no ambiente vão para Observações. No wizard: modo completo ou "somente evidências" |
+| 10 | `99_sanitizar_e_empacotar.sh` | Onde estiver a pasta de coleta | Sempre, antes de enviar |
 
 ## Exemplo completo (cliente com Oracle + SQL Server on Linux + OCI)
 
