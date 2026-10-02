@@ -690,7 +690,7 @@ fi
 [ -s "$TMPD/timeout" ] && al "Varredura interrompida por tempo limite (${TLIM}s) em: $(paste -sd';' "$TMPD/timeout"). Reexecutar com WISEDB_CLONE_TIMEOUT maior ou informar o diretorio de logs como extra"
 [ -s "$OUT/sql_erros.txt" ] && al "Erros ao consultar o controlfile de algumas instancias (ver sql_erros.txt): evidencias de restore dessas instancias podem estar incompletas"
 al "RPO e RTO acordados: A DEFINIR com o cliente; valores observados no ambiente em rpo_rto_observado.txt"
-grep -iE 'secret_access_key|aws_secret|password[[:space:]]*=' -l $(sort -u "$TMPD/scripts" | cut -d'|' -f4) 2>/dev/null | head -3 | while read -r f; do
+{ [ -s "$TMPD/scripts" ] && sort -u "$TMPD/scripts" | cut -d'|' -f4 | tr '\n' '\0' | xargs -0 -r grep -iE 'secret_access_key|aws_secret|password[[:space:]]*=' -l 2>/dev/null; } | head -3 | while read -r f; do
   al "Credencial em texto claro em script de clone: $f (valor mascarado na coleta)"
 done
 
