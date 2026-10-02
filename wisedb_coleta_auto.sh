@@ -980,7 +980,7 @@ fi # fim da coleta exclusiva do modo COMPLETA
 if [ "$RST_ON" = "1" ]; then
   info "Varrendo logs e scripts de clonagem (somente leitura)..."
   if dl 09_coleta_evidencias_restore.sh; then
-    if WISEDB_CLONE_DIRS="$RST_DIRS" WISEDB_ORA_SIDS="${ORA_SEL[*]:-}" bash "$TMP/09_coleta_evidencias_restore.sh"; then
+    if WISEDB_CLONE_DIRS="$RST_DIRS" WISEDB_ORA_SIDS="${ORA_SEL[*]:-}" bash "$TMP/09_coleta_evidencias_restore.sh" </dev/null; then
       ok "Evidencias de restauracao coletadas"
     else
       erro "Modulo 09 falhou durante a coleta"; MODULOS_FALHARAM+=("09_coleta_evidencias_restore.sh(execucao)"); COLETA_INCOMPLETA=1
