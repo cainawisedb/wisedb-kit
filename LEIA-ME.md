@@ -5,13 +5,19 @@
 Publique este kit em um repositório (GitHub, por exemplo) e rode UMA linha no servidor alvo. O orquestrador detecta o ambiente, baixa da mesma origem apenas os módulos necessários, conduz o wizard (incluir/remover itens e marcar ambientes fora do escopo da política, com justificativa), coleta, sanitiza, mostra o resumo e, após o "OK", gera `resultado_final.txt` (para colar na IA) e `resultado.json` (estruturado para integrações futuras).
 
 ```bash
-# Linux:
-bash <(curl -fsSL https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/kit_coleta_backup/wisedb_coleta_auto.sh)
+# Linux (usuario oracle ou dono das rotinas):
+export WISEDB_BASE_URL="https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main"
+bash <(curl -fsSL "$WISEDB_BASE_URL/wisedb_coleta_auto.sh")
+# So se aparecer "curl: (60)" (CA antiga): troque curl -fsSL por curl -kfsSL
 ```
 ```powershell
-# Windows (PowerShell admin):
-irm https://raw.githubusercontent.com/SUAORG/wisedb-kit/main/kit_coleta_backup/wisedb_coleta_auto.ps1 | iex
+# Windows (PowerShell como administrador, PS 3.0+):
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$env:WISEDB_BASE_URL="https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main"
+Invoke-WebRequest -Uri "$env:WISEDB_BASE_URL/wisedb_coleta_auto.ps1" -OutFile "wisedb_coleta_auto.ps1" -UseBasicParsing
+powershell -ExecutionPolicy Bypass -File ".\wisedb_coleta_auto.ps1"
 ```
+Manual completo do fluxo para colaboradores: M-001 v2.0.
 
 Para apontar outro repositório sem editar o script: `export WISEDB_BASE_URL="https://.../kit_coleta_backup"` antes de rodar (Linux) ou `$env:WISEDB_BASE_URL = "..."` (Windows). Repositório privado funciona incluindo o token de leitura na URL raw.
 
@@ -48,6 +54,7 @@ Todos os scripts são **somente leitura** e seguros para produção. Nenhum dele
 | 7a | `07_coleta_hypervisor_windows.ps1` | Host Hyper-V ou máquina com PowerCLI | Inventário de VMs Hyper-V/VMware + snapshots antigos, para cruzar com os jobs e achar VMs sem proteção |
 | 7b | `07_coleta_hypervisor_linux.sh` | Host Proxmox/PBS/KVM (root) | Jobs vzdump, retenção (prune), verify/sync do PBS, VMs sem backup, snapshots libvirt |
 | 8 | `08_coleta_cloud_outras.sh` | Servidor central com az/aws CLI | Se houver VMs em Azure (Recovery Services Vault) ou AWS (AWS Backup, EBS snapshots, DLM) |
+| 8b | `10_coleta_oracle_windows.ps1` | Servidor Windows com OracleService* (PowerShell admin, grupo ORA_DBA) | Equivalente Windows do 02 (RMAN, 35 dias, archive, FRA, Data Guard, Data Pump). Chamado automaticamente pelo orquestrador |
 | 9 | `09_coleta_evidencias_restore.sh` | Servidor onde a clonagem executa (usuário `oracle`) | Evidências de teste de restauração (Anexo I) com descoberta automática: cron e scripts chamados, varredura por conteúdo e `v$rman_status` dos bancos locais. Classifica BACKUP_RMAN x ACTIVE_DATABASE x DATAPUMP x SQLSERVER x RESTORE_VALIDATE. RPO/RTO acordados ficam A DEFINIR; os observados no ambiente vão para Observações. No wizard: modo completo ou "somente evidências" |
 | 10 | `99_sanitizar_e_empacotar.sh` | Onde estiver a pasta de coleta | Sempre, antes de enviar |
 

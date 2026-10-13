@@ -12,6 +12,12 @@
 #                 --tenancy <ocid1.tenancy...> [--bucket <nome_bucket_backup>]
 #            O profile ~/.oci/config do cliente ja deve existir no servidor.
 # SAIDA    : ./coleta_oci_<profile>_<data>/
+#
+# Versao 1.2 (outubro/2026)
+#   [CORRIGIDO] bash 4.2 (OL/RHEL 7): tenancy sem bucket abortava o modulo em
+#               BUCKETS[@] unbound; DB Systems, Recovery Service e cross-region
+#               nao eram coletados.
+#   [CORRIGIDO] Cross-region consultado tambem nas regioes de DESTINO assinadas.
 #===============================================================================
 set -uo pipefail
 
@@ -135,11 +141,12 @@ run 30_buckets.txt "Namespace e buckets por compartment" \
 
 # Bucket especifico de backup (se informado) ou todos os buckets encontrados
 if [ -n "$BUCKET" ]; then BUCKETS=("$BUCKET"); else
+  BUCKETS=()
   mapfile -t BUCKETS < <(for C in "${COMPS[@]}"; do
     eval "$OCI os bucket list --compartment-id $C --all --query 'data[].name' --raw-output" 2>/dev/null
   done | tr -d '",[] ' | grep -v '^$' | sort -u)
 fi
-for B in "${BUCKETS[@]}"; do
+for B in ${BUCKETS[@]+"${BUCKETS[@]}"}; do
   run 31_bucket_${B}_detalhe.txt "Detalhe do bucket $B (versionamento, tier)" \
     "$OCI os bucket get --bucket-name $B --namespace $NS \
      --query 'data.{nome:name, versionamento:versioning, tier:\"storage-tier\", publico:\"public-access-type\"}' --output table"
@@ -237,7 +244,23 @@ run 50_cross_region.txt "Verificacao de copia cross-region (volume backups e DB 
      $OCI bv boot-volume-backup list --compartment-id \$C --all \
        --query 'data[?\"source-boot-volume-backup-id\"!=null].{nome:\"display-name\", origem:\"source-boot-volume-backup-id\", criado:\"time-created\"}' --output table; \
    done; \
-   echo; echo '-- Se as duas listas acima estiverem vazias, nao ha copia cross-region de volume nesta regiao.'"
+   echo; echo '-- Se as duas listas acima estiverem vazias, nao ha copia cross-region de volume RECEBIDA nesta regiao.'"
+
+# A copia cross-region aparece na regiao de DESTINO, nao na de origem (licao do
+# Parecer R-001 Interne, sa-vinhedo-1). Consultar so a regiao primaria dava
+# falso negativo. Aqui cada regiao assinada alem da primaria e consultada.
+REG_PRIM="${REGION:-$(awk -v p="[$PROFILE]" '$0==p{f=1;next} /^\[/{f=0} f&&/^region/{sub(/.*=[[:space:]]*/,"");print;exit}' "${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)}"
+mapfile -t REGS_SUB < <(eval "oci --profile $PROFILE iam region-subscription list --query 'data[].\"region-name\"' --raw-output" 2>/dev/null | tr -d '",[] ' | grep -v '^$')
+for RG in ${REGS_SUB[@]+"${REGS_SUB[@]}"}; do
+  [ "$RG" = "$REG_PRIM" ] && continue
+  run 51_cross_region_destino_${RG}.txt "Copias cross-region RECEBIDAS na regiao $RG (origem em outra regiao)" \
+    "for C in ${COMPS[*]}; do \
+       oci --profile $PROFILE --region $RG bv backup list --compartment-id \$C --all \
+         --query 'data[?\"source-volume-backup-id\"!=null].{nome:\"display-name\", origem:\"source-volume-backup-id\", criado:\"time-created\"}' --output table; \
+       oci --profile $PROFILE --region $RG bv boot-volume-backup list --compartment-id \$C --all \
+         --query 'data[?\"source-boot-volume-backup-id\"!=null].{nome:\"display-name\", origem:\"source-boot-volume-backup-id\", criado:\"time-created\"}' --output table; \
+     done; echo '-- Lista vazia: nenhuma copia de volume desta tenancy chegou em $RG.'"
+done
 
 echo "Coleta OCI concluida em $OUT. Revise os arquivos antes de enviar."
 echo "Nota: sintaxe de subcomandos pode variar entre versoes do OCI CLI; se um bloco falhar, envie o erro junto."

@@ -20,6 +20,20 @@
 #
 # RISCO: Zero no ambiente. Somente leitura.
 #
+# v3.7 (outubro/2026) - rodada de testes multiplataforma
+#   [CRITICO]   Mascara de segredos reescrita: valores entre aspas (OCI_TOKEN="..",
+#               PASSWORD='..'), JSON/YAML, --password valor, -Psenha, Bearer e chave
+#               AWS. Pacote passa a exigir confirmacao explicita se sobrar segredo.
+#   [CORRIGIDO] Falha do modulo 05 (OCI) agora marca a coleta como INCOMPLETA.
+#   [NOVO]      escopo_wizard.txt: exclusoes, justificativas, alertas e sudo vao
+#               para o RESUMO (antes so existiam no resultado_final.txt).
+#   [CORRIGIDO] SQL Server on Linux usa a porta detectada (antes fixo 1433).
+#   [CRITICO]   Conta AWS/GCP/Azure que nao lembra o cliente exige confirmacao
+#               (antes o pacote podia levar a conta de outro cliente).
+#   [CORRIGIDO] Pacote .tar.gz leva cliente+data+hora; coletas do mesmo dia nao
+#               se sobrescrevem mais.
+#   [NOVO]      WISEDB_CLIENTE pre-define o nome do cliente (sessao sem TTY).
+#
 # v3.6.1 (setembro/2026)
 #   [CORRIGIDO] Modulo 09 v1.2: leitura robusta do sqlplus (12c devolvia o texto
 #               do SELECT como resultado), varredura sem travamento com tempo
@@ -106,7 +120,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.6.1"
+VERSAO="3.7"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -598,7 +612,7 @@ fi
 # FASE 3 - CLIENTE
 #===============================================================================
 titulo "FASE 3 - IDENTIFICACAO DO CLIENTE"
-pergunta "Nome do cliente (como aparece nos documentos)" CLIENTE ""
+pergunta "Nome do cliente (como aparece nos documentos)" CLIENTE "${WISEDB_CLIENTE:-}"
 while [ -z "$CLIENTE" ] || echo "$CLIENTE" | grep -qiE '^(teste|test|xxx|abc|a|123)$'; do
   [ "$INTER" = "0" ] && { CLIENTE="NAO_INFORMADO"; break; }
   warn "Nome invalido ou de teste. Ele vai para a politica e para o nome do pacote."
@@ -619,9 +633,12 @@ COERENTE=0
 for t in "$HOSTN" "$FQDN" "$VM_NOME_OCI"; do
   casa_cliente "$t" && { COERENTE=1; ok "Nome do cliente compativel com '$t'"; break; }
 done
-if [ "$COERENTE" = "0" ] && [ ${#OCI_PROF[@]} -gt 0 ]; then
-  for p in "${OCI_PROF[@]}"; do
-    casa_cliente "$p" && { COERENTE=1; ok "Nome do cliente compativel com o profile '$p'"; break; }
+if [ "$COERENTE" = "0" ]; then
+  # OCI, AWS, gcloud e Azure: a v3.6 so olhava profiles OCI e gerava falso
+  # alerta de "troca de cliente" em bastion com profile AWS do cliente.
+  for p in ${OCI_PROF[@]+"${OCI_PROF[@]}"} ${AWS_PROF[@]+"${AWS_PROF[@]}"} \
+           ${GCP_CONF[@]+"${GCP_CONF[@]}"} ${GCP_PROJ[@]+"${GCP_PROJ[@]}"} ${AZ_SUBNOME[@]+"${AZ_SUBNOME[@]}"}; do
+    casa_cliente "$p" && { COERENTE=1; ok "Nome do cliente compativel com o profile/conta '$p'"; break; }
   done
 fi
 if [ "$COERENTE" = "0" ]; then
@@ -800,6 +817,13 @@ if [ "$CLOUD_ALVOS" -gt 0 ]; then
   else
     for i in "${MENU_SEL[@]}"; do
       prov="${CL_PROV[i]}"; id="${CL_ID[i]}"; extra="${CL_EXTRA[i]}"; regs=""
+      # Mesma blindagem do profile OCI: conta que nao lembra o cliente exige
+      # confirmacao. Sem isto o pacote de um cliente levava a conta AWS de outro.
+      if ! casa_cliente "$id" && ! casa_cliente "${extra:-}"; then
+        warn "$prov '$id' nao lembra o nome '$CLIENTE'"
+        pergunta "Confirma que '$id' e do cliente '$CLIENTE'? (s/N)" CONF3 "N"
+        [ "${CONF3^^}" = "S" ] || { warn "Alvo $prov '$id' descartado pelo operador"; continue; }
+      fi
       case "$prov" in
         AWS)
           if ident=$(aws sts get-caller-identity --profile "$id" --output text \
@@ -924,7 +948,8 @@ if [ "$COLETA_LOCAL" = "1" ]; then
   fi
   if [ -n "$SQL_USER" ]; then
     if dl 03_coleta_sqlserver_linux.sh; then
-      if bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,1433" "$SQL_USER"; then ok "SQL Server coletado"; else erro "Modulo SQL Server falhou durante a coleta"; MODULOS_FALHARAM+=("03_coleta_sqlserver_linux.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+      SQL_PORTA=$(printf '%s\n' ${SQL_PORTAS[@]+"${SQL_PORTAS[@]}"} | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1)
+      if bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,${SQL_PORTA:-1433}" "$SQL_USER"; then ok "SQL Server coletado"; else erro "Modulo SQL Server falhou durante a coleta"; MODULOS_FALHARAM+=("03_coleta_sqlserver_linux.sh(execucao)"); COLETA_INCOMPLETA=1; fi
     fi
   fi
   if [ "$HYP_ON" = "1" ]; then
@@ -952,9 +977,16 @@ if [ -n "$OCI_SEL_PROF" ]; then
   info "Coleta OCI iniciada. Agora inclui IPs das instancias, volume groups, block volumes,"
   info "Recovery Service, backup config dos DB Systems, replicacao de bucket e verificacao"
   info "cross-region. Em tenancies grandes pode levar varios minutos; aguarde sem interromper."
-  dl 05_coleta_oci.sh && bash "$TMP/05_coleta_oci.sh" --profile "$OCI_SEL_PROF" \
-     ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" \
-     --obj-limit "${WISEDB_OBJ_LIMIT:-50}" && ok "OCI coletado (tenancy do cliente)"
+  if dl 05_coleta_oci.sh; then
+    if bash "$TMP/05_coleta_oci.sh" --profile "$OCI_SEL_PROF" \
+         ${OCI_SEL_REG:+--region "$OCI_SEL_REG"} --tenancy "$OCI_SEL_TEN" \
+         --obj-limit "${WISEDB_OBJ_LIMIT:-50}"; then
+      ok "OCI coletado (tenancy do cliente)"
+    else
+      erro "Modulo 05 (OCI) terminou com erro: parte da coleta OCI pode estar ausente"
+      MODULOS_FALHARAM+=("05_coleta_oci.sh(execucao)"); COLETA_INCOMPLETA=1
+    fi
+  fi
 fi
 
 # Nuvem publica alem da OCI. O modulo 08 e baixado pelo proprio orquestrador,
@@ -1002,6 +1034,22 @@ fi
   echo "## Coleta incompleta: $([ "$COLETA_INCOMPLETA" = "1" ] && echo SIM || echo NAO)"
   if [ ${#MODULOS_FALHARAM[@]} -gt 0 ]; then echo "## Modulos com falha: ${MODULOS_FALHARAM[*]}"; fi
 } > "$WORK/nivel_privilegio_coleta.txt"
+# Escopo declarado pelo operador. Na v3.6 isto so existia no resultado_final.txt
+# e o RESUMO (o que vai para a IA) perdia as exclusoes e as justificativas.
+{ echo "Cliente ............: $CLIENTE"
+  echo "Modo da coleta .....: $MODO"
+  echo "Papel do host ......: $PAPEL"
+  echo "Usuario / sudo .....: $(whoami) / $([ "$WISEDB_SUDO" = "1" ] && echo SIM || echo NAO)"
+  echo "Oracle no escopo ...: ${ORA_SEL[*]:-nenhum}"
+  echo "Profile OCI ........: ${OCI_SEL_PROF:-nenhum}"
+  echo "Coleta incompleta ..: $([ "$COLETA_INCOMPLETA" = "1" ] && echo "SIM (${MODULOS_FALHARAM[*]})" || echo NAO)"
+  echo "Fora do escopo (declarado pelo operador, NAO tratar como servico assegurado):"
+  if [ ${#EXCL[@]} -eq 0 ]; then echo "  (nenhum)"; else
+    for e in "${EXCL[@]}"; do echo "  - ${e%%|*} | Justificativa: ${e##*|}"; done; fi
+  echo "Alertas do wizard:"
+  if [ ${#ALERTAS[@]} -eq 0 ]; then echo "  (nenhum)"; else
+    for a in "${ALERTAS[@]}"; do echo "  ! $a"; done; fi
+} > "$WORK/escopo_wizard.txt"
 cd "$ORIG_DIR"
 export WISEDB_SSL_FALLBACK_USED="$SSL_FALLBACK_USADO"
 export WISEDB_COLETA_INCOMPLETA="$COLETA_INCOMPLETA"
@@ -1010,15 +1058,34 @@ export WISEDB_COLETA_INCOMPLETA="$COLETA_INCOMPLETA"
 # FASE 7 - SANITIZACAO, CONSOLIDACAO, SAIDA
 #===============================================================================
 titulo "FASE 7 - SANITIZACAO E CONSOLIDACAO"
-find "$WORK" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.json" \) -print0 |
+# Mascara unica do kit (v3.7). Cobre valor entre aspas simples/duplas, JSON,
+# YAML, --password valor, user/senha@, connect user/senha, -P do sqlcmd, Bearer
+# e chaves AWS. A v3.6 nao mascarava OCI_TOKEN="..." nem PASSWORD="..." e o
+# segredo saia no pacote (mesmo padrao do vazamento DBS Partner, set/2026).
+MASK_SED="$WORK/.mascara.sed"
+cat > "$MASK_SED" <<'SEDEOF'
+s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
+s/(--?(password|passwd|pwd|senha|token|secret)[[:space:]]+)("[^"]*"|'[^']*'|[^-[:space:]][^[:space:]]*)/\1***REMOVIDO***/Ig
+s/(identified[[:space:]]+by[[:space:]]+)("[^"]*"|[^[:space:];]+)/\1***REMOVIDO***/Ig
+s#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g
+s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}@#\1/***REMOVIDO***@#g
+s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig
+s#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s/(sqlcmd[^|;]*[[:space:]]-P[[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/([[:space:]]-P[[:space:]]+)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1***REMOVIDO***/Ig
+s/(AKIA|ASIA)[0-9A-Z]{16}/\1***REMOVIDO***/g
+SEDEOF
+find "$WORK" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.json" -o -name "*.tsv" \
+     -o -name "*.csv" -o -name "*.ora" -o -name "*.sh" -o -name "*.conf" -o -name "*.cfg" \) \
+     ! -name ".mascara.sed" -print0 |
 while IFS= read -r -d '' f; do
-  sed -i -E \
-    -e 's/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|key|key_id|keyid))[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig' \
-    -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
-    -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' \
-    -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"'*]{3,}@#\1/***REMOVIDO***@#g' \
-    -e 's/(-P[[:space:]]+)[^[:space:]]+/\1***REMOVIDO***/g' "$f"
+  sed -i -E -f "$MASK_SED" "$f"
 done
+rm -f "$MASK_SED"
+# Deteccao de segredo remanescente (o que a mascara nao reconheceu).
+SEG_RX='(password|passwd|senha|secret|token|api_?key|access_?key)["'"'"']?[[:space:]]*[=:][[:space:]]*["'"'"']?[^*[:space:]"'"'"']'
+grep -rniIE "$SEG_RX" "$WORK" 2>/dev/null | grep -v 'REMOVIDO' > "$WORK/.segredos_remanescentes" || true
 TMP_DIGEST="$WORK/.digest"; mkdir -p "$TMP_DIGEST"
 [ -f "$TMP/wisedb_digest.py" ] && cp "$TMP/wisedb_digest.py" "$TMP_DIGEST/" 2>/dev/null
 rm -rf "$TMP"
@@ -1135,11 +1202,20 @@ say "  Cliente ...........: ${NEG}$CLIENTE${R}"
 say "  Papel do host .....: $PAPEL"
 say "  Arquivos coletados : $(find "$WORK" -name '*.txt' | wc -l)"
 say "  Alertas ...........: ${#ALERTAS[@]}"
-info "Segredos remanescentes:"
-grep -rniE 'password|passwd|secret|token' "$WORK" 2>/dev/null | grep -v 'REMOVIDO' | head -5 || info "  nenhum"
-pergunta "Gerar pacote final? (S/n)" OKF "S"
+SEG_N=$(grep -c . "$WORK/.segredos_remanescentes" 2>/dev/null); SEG_N=${SEG_N:-0}
+if [ "${SEG_N:-0}" -gt 0 ]; then
+  say "  ${VERM}${NEG}POSSIVEL SEGREDO NAO MASCARADO: $SEG_N linha(s)${R}"
+  head -10 "$WORK/.segredos_remanescentes" | sed "s|$WORK/||" | while IFS= read -r l; do info "  $l"; done
+  info "Revise/edite esses arquivos antes de enviar. O pacote so e gerado com confirmacao explicita."
+  pergunta "Gerar o pacote MESMO ASSIM? (s/N)" OKF "N"
+  [ "${OKF^^}" = "S" ] || OKF="N"
+else
+  info "Segredos remanescentes: nenhum"
+  pergunta "Gerar pacote final? (S/n)" OKF "S"
+fi
+rm -f "$WORK/.segredos_remanescentes"
 if [ "${OKF^^}" != "N" ]; then
-  PAC="$ORIG_DIR/wisedb_coleta_${CLIENTE// /_}_${HOSTN}_${DATA}${SUF_MODO}.tar.gz"
+  PAC="$ORIG_DIR/$(basename "$WORK").tar.gz"
   tar -czf "$PAC" -C "$ORIG_DIR" "$(basename "$WORK")"
   say ""
   if [ "$COLETA_INCOMPLETA" = "1" ]; then

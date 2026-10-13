@@ -21,7 +21,17 @@
             WMI/schtasks/net use quando ausentes.
 ===============================================================================
 #>
-param([string]$Instancia = $env:COMPUTERNAME, [switch]$SkipVeeam)
+param([string[]]$Instancia = @(), [switch]$SkipVeeam)
+
+# v1.2 (outubro/2026): instancias nomeadas (MSSQL$NOME) detectadas sozinhas; antes
+# so a instancia padrao era consultada e servidor TOTVS/Express saia sem msdb.
+if ($Instancia.Count -eq 0) {
+  $Instancia = @(Get-Service -Name 'MSSQL*' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Status -eq 'Running' -and ($_.Name -eq 'MSSQLSERVER' -or $_.Name -like 'MSSQL$*') } |
+    ForEach-Object { if ($_.Name -eq 'MSSQLSERVER') { $env:COMPUTERNAME } else { "$env:COMPUTERNAME\" + ($_.Name -replace '^MSSQL\$','') } })
+  # Sem servico SQL ativo nao consulta nada: antes caia na instancia padrao e
+  # gerava "sem conexao" em servidor que nem tem SQL Server (ruido na politica).
+}
 
 $Hostn = $env:COMPUTERNAME
 $Out = ".\coleta_${Hostn}_$(Get-Date -Format yyyyMMdd)\04_windows"
@@ -91,7 +101,10 @@ if (Has 'Get-SmbMapping') {
 
 Etapa "TAREFAS AGENDADAS RELACIONADAS A BACKUP"
 if (Has 'Get-ScheduledTask') {
-  Get-ScheduledTask | Where-Object { $_.TaskName -match 'backup|bkp|sql|veeam|rman|dump' -and $_.State -ne 'Disabled' } |
+  # Filtra pelo nome E pela acao: tarefa "Rotina_Noturna" chamando expdp.cmd ficava de fora.
+  $rxTask = 'backup|bkp|sql|veeam|rman|dump|expdp|exp\.exe|datapump|robocopy|wbadmin'
+  Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' -and ($_.TaskName -match $rxTask -or
+      (($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' ') -match $rxTask) } |
     ForEach-Object {
       $info = $_ | Get-ScheduledTaskInfo
       New-Object psobject -Property @{
@@ -140,12 +153,19 @@ LEFT JOIN msdb.dbo.sysschedules s ON s.schedule_id=js.schedule_id
 ORDER BY j.name;
 "@
 }
-if (Has 'sqlcmd') {
+if ($Instancia.Count -eq 0) {
+  Sec "SQL SERVER"
+  "Nenhum servico SQL Server (MSSQLSERVER / MSSQL`$<instancia>) em execucao neste host." | Out-File $Arq -Append -Encoding utf8
+} elseif (Has 'sqlcmd') {
   # -l 15 evita que uma instancia inacessivel segure o modulo por minutos.
-  foreach ($k in $Queries.Keys) {
-    Etapa "SQL: $k"
-    sqlcmd -S $Instancia -E -W -s ' | ' -l 15 -Q "SET NOCOUNT ON; $($Queries[$k])" 2>&1 |
-      Out-File $Arq -Append -Encoding utf8
+  # sqlcmd 18 (ODBC 18) exige -C com certificado autoassinado; versoes antigas nao tem -C.
+  $opC = @(); if ((& sqlcmd -? 2>&1 | Out-String) -match '-C\s') { $opC = @('-C') }
+  foreach ($inst in $Instancia) {
+    foreach ($k in $Queries.Keys) {
+      Etapa "SQL [$inst]: $k"
+      & sqlcmd -S $inst -E -W -s ' | ' -l 15 @opC -Q "SET NOCOUNT ON; $($Queries[$k])" 2>&1 |
+        Out-File $Arq -Append -Encoding utf8
+    }
   }
 } else {
   Sec "SQL SERVER"

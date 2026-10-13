@@ -13,6 +13,12 @@
 #              WISEDB_DUMP_DIRS="/u02/Backup:/dados/dump" bash 02_coleta_oracle.sh
 # SAIDA    : ./coleta_<hostname>_<data>/02_oracle/
 #
+# Versao 1.2 (outubro/2026)
+#   [CORRIGIDO] 12c/11g: banner_full (18c+) e FETCH FIRST (12c+) trocados por
+#               banner e ROWNUM; secoes inteiras falhavam no BI 12c.
+#   [CORRIGIDO] sqlplus ausente ou "/ as sysdba" sem conexao agora retornam erro
+#               ao orquestrador (antes o modulo sempre reportava sucesso).
+#
 # Versao 1.1 (setembro/2026)
 #   [CORRIGIDO] Nivel 0 x nivel 1 agora vem de v$backup_datafile.incremental_level.
 #               Antes era inferido por limiar fixo de 100 GB, o que classificava
@@ -60,6 +66,7 @@ if [ ${#SIDS[@]} -eq 0 ]; then
 fi
 echo "SIDs a coletar: ${SIDS[*]}"
 
+FALHAS_SID=0
 for SID in "${SIDS[@]}"; do
   export ORACLE_SID="$SID"
   export ORAENV_ASK=NO
@@ -68,6 +75,10 @@ for SID in "${SIDS[@]}"; do
   : > "${F}_sql.txt"    # trunca: reexecucao no mesmo dia nao duplica evidencia
   : > "${F}_rman.txt"
   echo "=== Coletando $SID ==="
+  if ! command -v sqlplus >/dev/null 2>&1; then
+    echo "[ERRO] sqlplus nao encontrado para $SID (ORACLE_HOME='${ORACLE_HOME:-}'). Rode como oracle com o ambiente do banco." | tee -a "${F}_sql.txt"
+    FALHAS_SID=$((FALHAS_SID+1)); continue
+  fi
 
   #--- Consultas SQL (somente SELECT) -----------------------------------------
   sqlplus -S / as sysdba >> "${F}_sql.txt" 2>&1 <<'EOF'
@@ -76,7 +87,7 @@ col name for a15
 col value for a55
 prompt ### IDENTIFICACAO
 select name, dbid, database_role role, log_mode, open_mode, created from v$database;
-select banner_full from v$version where rownum=1;
+select banner from v$version where rownum=1;
 select instance_name, host_name, status, to_char(startup_time,'DD/MM/YYYY HH24:MI') startup from v$instance;
 prompt ### PDBs (multitenant)
 col pdb for a25
@@ -146,9 +157,9 @@ from v$backup_datafile
 where incremental_level is not null
 group by incremental_level order by 1;
 prompt ### RMAN - FALHAS (v$rman_backup_job_details, ultimos 35 dias)
-select to_char(start_time,'DD/MM/YYYY HH24:MI') inicio, input_type, status
+select * from (select to_char(start_time,'DD/MM/YYYY HH24:MI') inicio, input_type, status
 from v$rman_backup_job_details
-where start_time > sysdate-35 and status not like 'COMPLETED%' order by start_time desc fetch first 15 rows only;
+where start_time > sysdate-35 and status not like 'COMPLETED%' order by start_time desc) where rownum <= 15;
 prompt ### RMAN - FALHAS AGRUPADAS POR TIPO (identifica falha sistemica x pontual)
 select input_type,
        count(*) falhas,
@@ -162,22 +173,22 @@ prompt ### RMAN - FALHAS (v$rman_status, detalhe operacional)
 col operacao for a28
 col objeto for a14
 col device for a10
-select to_char(start_time,'DD/MM HH24:MI') inicio, operation operacao,
+select * from (select to_char(start_time,'DD/MM HH24:MI') inicio, operation operacao,
        object_type objeto, status, output_device_type device
 from v$rman_status
 where start_time > sysdate-35 and status like '%FAILED%'
-order by start_time desc fetch first 20 rows only;
+order by start_time desc) where rownum <= 20;
 prompt ### RMAN - OUTPUT DA FALHA MAIS RECENTE (causa raiz)
 col output for a110
-select output from v$rman_output
+select output from (select output from v$rman_output
 where session_key = (select max(session_key) from v$rman_status
                      where status like '%FAILED%' and start_time > sysdate-35)
-order by recid fetch first 40 rows only;
+order by recid) where rownum <= 40;
 prompt ### RMAN - CAUSA RAIZ POR TIPO DE OBJETO QUE FALHA (uma falha por tipo)
 prompt ### A consulta acima traz apenas a falha mais recente do banco inteiro.
 prompt ### Quando um tipo falha todos os dias, ele pode ficar mascarado por outro.
 col objeto for a14
-select s.object_type objeto, o.output
+select objeto, output from (select s.object_type objeto, o.output
 from v$rman_output o
 join (select object_type, max(session_key) sk
       from v$rman_status
@@ -186,7 +197,7 @@ join (select object_type, max(session_key) sk
       group by object_type) f on f.sk = o.session_key
 join v$rman_status s on s.session_key = f.sk and s.object_type = f.object_type
 where o.output is not null
-order by s.object_type, o.recid fetch first 120 rows only;
+order by s.object_type, o.recid) where rownum <= 120;
 prompt ### ARCHIVELOG - VOLUME REAL POR DIA (7 DIAS)
 select to_char(completion_time,'DD/MM') dia, count(*) qtd_archives,
        round(sum(blocks*block_size)/1024/1024/1024,1) gb
@@ -284,6 +295,9 @@ EOF
     echo
   } >> "${F}_destino_sbt.txt" 2>&1
 
+  if grep -qE 'ORA-01034|ORA-01031|ORA-12560|ORA-12162|SP2-0642|ERROR:' "${F}_sql.txt" && ! grep -q '### IDENTIFICACAO' "${F}_sql.txt"; then
+    echo "[ERRO] $SID: sem conexao / as sysdba (ver ${F}_sql.txt)"; FALHAS_SID=$((FALHAS_SID+1))
+  fi
 done
 
 #--- Agendador real do backup em DB System / ODA (dbcli) ------------------------
@@ -408,3 +422,8 @@ if [ "$ACHOU" = "0" ]; then
 fi
 
 echo "Coleta Oracle concluida em $OUT. Revise antes de enviar."
+if [ "$FALHAS_SID" -ge "${#SIDS[@]}" ]; then
+  echo "[ERRO] Nenhuma instancia Oracle foi coletada com sucesso ($FALHAS_SID de ${#SIDS[@]})."; exit 2
+elif [ "$FALHAS_SID" -gt 0 ]; then
+  echo "[AVISO] $FALHAS_SID de ${#SIDS[@]} instancia(s) sem coleta SQL."; exit 3
+fi

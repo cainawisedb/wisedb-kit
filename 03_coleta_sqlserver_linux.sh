@@ -21,7 +21,10 @@ USR="${2:?Uso: $0 <servidor,porta> <usuario>}"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 OUT="./coleta_${HOSTN}_$(date +%Y%m%d)/03_sqlserver"
 mkdir -p "$OUT"
-SQLCMD=$(command -v sqlcmd || echo /opt/mssql-tools18/bin/sqlcmd)
+SQLCMD=$(command -v sqlcmd 2>/dev/null)
+# mssql-tools nao entra no PATH de sessao nao interativa/sudo: tenta v18 e v17.
+[ -z "$SQLCMD" ] && for c in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd; do [ -x "$c" ] && { SQLCMD="$c"; break; }; done
+SQLCMD="${SQLCMD:-/opt/mssql-tools18/bin/sqlcmd}"
 FALHAS=0
 
 # Progresso e prompts vao para o terminal real. Como Q() redireciona 2>&1 para o
@@ -33,7 +36,7 @@ if ( : > /dev/tty ) 2>/dev/null; then exec 9>/dev/tty; TEM_TTY=1; fi
 diga(){ printf '%s\n' "$*" >&9; }
 
 if [ ! -x "$SQLCMD" ]; then
-  diga "ERRO: sqlcmd nao encontrado em '$SQLCMD'. Instale mssql-tools18 ou ajuste o PATH."
+  diga "ERRO: sqlcmd nao encontrado (PATH, /opt/mssql-tools18/bin, /opt/mssql-tools/bin). Instale mssql-tools18."
   exit 1
 fi
 

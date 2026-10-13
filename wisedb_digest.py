@@ -10,6 +10,15 @@ Os arquivos brutos completos permanecem no pacote .tar.gz.
 Uso: python3 wisedb_digest.py <pasta_coleta> <cliente> <papel_host> [saida]
 Compativel com Python 3.6+ (sem f-strings aninhadas).
 
+Versao 2.4 (outubro/2026)
+  [CORRIGIDO] Windows: os.uname() inexistente derrubava o digest (RESUMO nunca
+              era gerado em Windows).
+  [NOVO]      Secao ESCOPO DECLARADO NO WIZARD (exclusoes, justificativas,
+              alertas, sudo, coleta incompleta).
+  [CORRIGIDO] Retention rule com consulta falha nao vira mais "existe mas nao
+              travada"; lifecycle ilegivel vira "nao evidenciado".
+  [NOVO]      Cross-region lido tambem das regioes de destino (51_*).
+
 Versao 2.3 (setembro/2026)
   [ALTERADO]  RPO/RTO acordados: A DEFINIR; observado vem do modulo 09.
 
@@ -41,7 +50,7 @@ Versao 2.1 (setembro/2026)
               corte de linha passou de 100 para 118 colunas para nao truncar as
               tabelas do RMAN.
 """
-import os, re, sys, glob
+import os, re, sys, glob, socket
 
 raiz    = os.path.abspath(sys.argv[1])
 cliente = sys.argv[2] if len(sys.argv) > 2 else "NAO_INFORMADO"
@@ -112,7 +121,8 @@ def bases_com_evidencia(r):
 
 
 BASES = bases_com_evidencia(raiz)
-host_local = os.uname().nodename.split(".")[0]
+# os.uname() nao existe no Python para Windows: o RESUMO nunca era gerado la.
+host_local = (socket.gethostname() or "").split(".")[0].lower()
 
 
 def escolhe_base(cands):
@@ -124,7 +134,7 @@ def escolhe_base(cands):
     if not cands:
         return raiz
     for d in cands:
-        if host_local and host_local in os.path.basename(d):
+        if host_local and host_local in os.path.basename(d).lower():
             return d
     return cands[0]
 
@@ -221,6 +231,17 @@ if os.path.realpath(base) != os.path.realpath(raiz):
     add("# Evidencias em : " + os.path.relpath(base, raiz))
 add("#" * 70)
 
+# Escopo declarado pelo operador no wizard (v3.7 / ps1 v2.3). Sem isto a IA
+# recebia bases marcadas como fora do escopo como se fossem assseguradas.
+esc = ler(os.path.join(raiz, "escopo_wizard.txt"))
+if esc.strip():
+    sec("ESCOPO DECLARADO NO WIZARD (operador)")
+    for ln in esc.lstrip("\ufeff").splitlines():
+        if ln.strip():
+            add("  " + ln.rstrip()[:118])
+    if re.search(r'Coleta incompleta \.*: SIM', esc):
+        ALERTAS.append("Coleta INCOMPLETA: um ou mais modulos falharam (ver ESCOPO DECLARADO NO WIZARD)")
+
 if papel == "ESTACAO_COLETA_WISEDB":
     add("# NOTA: host de ferramenta WiseDB. Dados locais NAO pertencem ao cliente;")
     add("#       somente a coleta OCI abaixo e evidencia do cliente.")
@@ -301,6 +322,13 @@ if len(OCI_DIRS) > 1:
                        "diferentes (" + ", ".join(perfis) + "). Isso indica reuso de pasta de "
                        "trabalho entre clientes. NAO use este pacote para gerar politica: "
                        "identifique o profile do cliente correto e recolete em pasta limpa")
+
+# Mesma guarda para AWS/GCP/Azure: mais de um alvo no pacote precisa ser do
+# mesmo cliente (o operador confirma no wizard; aqui fica registrado).
+_cl = sorted({os.path.basename(d).rsplit("_", 1)[0] for d in glob.glob(os.path.join(raiz, "coleta_cloud_*"))})
+if len(_cl) > 1:
+    ALERTAS.append("Pacote com mais de uma conta de nuvem publica (" + ", ".join(_cl) + "): confirmar que TODAS "
+                   "pertencem ao cliente antes de usar na politica")
 
 # ============================ 1. SERVIDOR ===================================
 inv = ler_ev(os.path.join("01_linux", "inventario_geral.txt"))
@@ -492,8 +520,40 @@ if ex:
                        "-> revalidar informando os diretorios de dump como argumento")
 
 # ============================ 3. SQL SERVER =================================
-sqlsrv = achar_ev(os.path.join("03_sqlserver", "sqlserver_evidencias.txt")) or \
-         achar_ev(os.path.join("04_windows", "windows_evidencias.txt"))
+# --- Windows (modulo 04 v1.2): agendamentos e SQL Server por instancia ------
+win = achar_ev(os.path.join("04_windows", "windows_evidencias.txt"))
+if win:
+    tw = ler(win).lstrip("\ufeff")
+    sec("SERVIDOR WINDOWS")
+    for marca, titulo, lim in [("IDENTIFICACAO DO SERVIDOR", "Identificacao", 8),
+                               ("DISCOS E VOLUMES", "Discos", 12),
+                               ("MAPEAMENTOS DE REDE", "Mapeamentos (destinos de backup)", 8),
+                               ("TAREFAS AGENDADAS RELACIONADAS A BACKUP", "Tarefas agendadas de backup", 30)]:
+        b = bruto(tw, marca, "################", lim)
+        if b:
+            add("  [" + titulo + "]")
+            for ln in b: add("  " + ln)
+    insts = re.findall(r'#+ SQL \[([^\]]+)\]: VERSAO', tw)
+    for inst in insts:
+        sec("SQL SERVER (Windows): " + inst)
+        for marca, titulo, lim in [("VERSAO SQL SERVER", "Versao", 3),
+                                   ("BASES E RECOVERY MODEL", "Bases e recovery model", 25),
+                                   ("HISTORICO DE BACKUPS - 15 DIAS", "Historico de backups (15d, amostra)", 30),
+                                   ("BASES SEM FULL EM 15 DIAS", "BASES SEM FULL EM 15 DIAS", 12),
+                                   ("JOBS DO SQL AGENT / MAINTENANCE PLANS", "Jobs do Agent", 15)]:
+            b = bruto(tw, "SQL [" + inst + "]: " + marca, "################", lim)
+            if b:
+                add("  [" + titulo + "]")
+                for ln in b: add("  " + ln)
+            if b and any("Could not open a connection" in x or "Login failed" in x for x in b):
+                ALERTAS.append("SQL Server " + inst + ": sem conexao no bloco '" + marca + "' -> historico do msdb NAO evidenciado")
+            if b and marca.startswith("BASES SEM FULL") and any(re.search(r'\w', x) and "name" not in x and "---" not in x
+                                                              and "Could not" not in x for x in b):
+                ALERTAS.append("SQL Server " + inst + ": ha bases sem FULL nos ultimos 15 dias (ver secao)")
+    if "sqlcmd nao encontrado" in tw:
+        ALERTAS.append("Windows: sqlcmd ausente, historico do msdb NAO coletado")
+
+sqlsrv = achar_ev(os.path.join("03_sqlserver", "sqlserver_evidencias.txt"))
 if sqlsrv:
     t = ler(sqlsrv)
     sec("SQL SERVER")
@@ -642,7 +702,10 @@ elif oci_dirs:
         pub  = m.group(1) if m else "?"
 
         rt = ler(os.path.join(od, "31_bucket_" + nome + "_retention.txt"))
-        if '"items": []' in rt:
+        if not rt.strip() or "[AVISO]" in rt or '"items"' not in rt:
+            imut = "NAO EVIDENCIADA (consulta falhou ou sem permissao)"
+            ALERTAS.append("Bucket " + nome + ": retention rule nao evidenciada (comando falhou) -> imutabilidade A CONFIRMAR")
+        elif re.search(r'"items":\s*\[\s*\]', rt):
             imut = "SEM retention rule"
             ALERTAS.append("Bucket " + nome + ": sem retention rule -> nao ha imutabilidade")
         else:
@@ -663,7 +726,8 @@ elif oci_dirs:
             am = re.search(r'"time-amount":\s*(\d+)', lf)
             un = re.search(r'"time-unit":\s*"(\w+)"', lf)
             ac = re.search(r'"action":\s*"(\w+)"', lf)
-            life = (ac.group(1).lower() if ac else "?") + " apos " + (am.group(1) if am else "?") + " " + (un.group(1).lower() if un else "?")
+            life = ((ac.group(1).lower() + " apos " + (am.group(1) if am else "?") + " " + (un.group(1).lower() if un else "?"))
+                    if ac else "nao evidenciado (consulta sem regra legivel)")
 
         add("    " + nome + ": versionamento=" + vers + " | acesso=" + pub)
         add("      imutabilidade: " + imut + " | lifecycle: " + life)
@@ -741,8 +805,13 @@ elif oci_dirs:
         copias = re.findall(r'ocid1\.(?:volumebackup|bootvolumebackup)\.', t)
         if regioes:
             add("  Regioes assinadas pela tenancy: " + ", ".join(sorted(set(regioes))))
+        for dst in sorted(glob.glob(os.path.join(od, "51_cross_region_destino_*.txt"))):
+            n = len(re.findall(r'ocid1\.(?:volumebackup|bootvolumebackup)\.', ler(dst)))
+            rg = os.path.basename(dst).replace("51_cross_region_destino_", "").replace(".txt", "")
+            add("  Regiao destino " + rg + ": " + str(n) + " copia(s) de volume recebida(s)")
+            copias += ["x"] * n
         if copias:
-            add("  Copias de volume recebidas de outra regiao: " + str(len(copias)))
+            add("  Copias de volume em outra regiao: " + str(len(copias)))
         else:
             add("  Nenhuma copia cross-region de volume identificada nesta regiao")
             ALERTAS.append("Nenhuma copia cross-region identificada: o criterio '1 copia offsite' do "
@@ -762,7 +831,8 @@ elif oci_dirs:
             add("  Buckets com replicacao ativa: " + ", ".join(com_rep))
         else:
             add("  Nenhum bucket com politica de replicacao: dumps existem em uma unica regiao")
-else:
+elif re.search(r'libopc|oraclecloud|OPC_PFILE|dbcli|libra\.so|ocid1\.', "".join(
+        ler(f) for f in glob_todas_bases(os.path.join("02_oracle", "*_destino_sbt.txt"))) + ler_ev("escopo_wizard.txt") + papel):
     ALERTAS.append("Coleta OCI ausente neste pacote: retencao real na nuvem, imutabilidade de bucket, "
                    "politica de boot/block volume e snapshots de FSS nao foram evidenciados")
 

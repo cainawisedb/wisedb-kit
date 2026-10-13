@@ -28,6 +28,10 @@
 #   [CORRIGIDO] Arquivos de saida truncados no inicio; reexecutar no mesmo dia
 #               nao concatena mais o conteudo anterior.
 #
+# Versao 1.3 (outubro/2026)
+#   [CRITICO]   Mascara igual a do orquestrador v3.7 (valores entre aspas, SENHA,
+#               KEY, --password, -P, Bearer, chave AWS).
+#
 # Versao 1.2 (setembro/2026)
 #   [CORRIGIDO] Profundidade da listagem dos diretorios de backup era fixa em 2
 #               niveis. Layouts comuns como /u02/Backup/<SID>/Bkp_Logico/<PDB>
@@ -75,10 +79,17 @@ run(){ # run "titulo" comando...
 # Regras de mascaramento de segredos, em arquivo para evitar inferno de quoting.
 SEDF="$OUT/.mascara.sed"
 cat > "$SEDF" <<'SEDEOF'
-s/((password|passwd|pwd|secret|token|apikey|api_key|client_secret)[[:space:]]*[=:][[:space:]]*)[^[:space:]",]+/\1***REMOVIDO***/Ig
-s/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig
+s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
+s/(--?(password|passwd|pwd|senha|token|secret)[[:space:]]+)("[^"]*"|'[^']*'|[^-[:space:]][^[:space:]]*)/\1***REMOVIDO***/Ig
+s/(identified[[:space:]]+by[[:space:]]+)("[^"]*"|[^[:space:];]+)/\1***REMOVIDO***/Ig
 s#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g
-s#([A-Za-z0-9_.$]+)/[^[:space:]/@"']{3,}@#\1/***REMOVIDO***@#g
+s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}@#\1/***REMOVIDO***@#g
+s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig
+s#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s/(sqlcmd[^|;]*[[:space:]]-P[[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/([[:space:]]-P[[:space:]]+)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1***REMOVIDO***/Ig
+s/(AKIA|ASIA)[0-9A-Z]{16}/\1***REMOVIDO***/g
 SEDEOF
 
 log "Iniciando coleta geral em $HOSTN (saida em $OUT)"

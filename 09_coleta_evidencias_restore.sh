@@ -98,17 +98,21 @@ existe(){ [ -e "$1" ] || { [ -n "$SUDO" ] && $SUDO test -e "$1" 2>/dev/null; }; 
 
 # Mascara de segredos: PASSWORD, PWD, SENHA, TOKEN, KEY, KEY_ID, SECRET, api_secret,
 # sqlcmd -P, user/senha@, user/senha as sysdba e connect target user/senha.
-mask(){
-  sed -E \
-    -e 's/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|token|secret|key|key_id|keyid))[[:space:]]*[=:][[:space:]]*)[^[:space:]",;]+/\1***REMOVIDO***/Ig' \
-    -e 's/(identified[[:space:]]+by[[:space:]]+)[^[:space:];]+/\1***REMOVIDO***/Ig' \
-    -e 's#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g' \
-    -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"'*]{2,}@#\1/***REMOVIDO***@#g' \
-    -e 's#([A-Za-z0-9_.$]+)/[^[:space:]/@"'"'"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig' \
-    -e 's#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["'"'"']?[A-Za-z0-9_.$]+)/[^[:space:]@"'"'"']+#\1/***REMOVIDO***#Ig' \
-    -e 's/(sqlcmd.*-P[[:space:]]*)[^[:space:]]+/\1***REMOVIDO***/g' \
-    -e 's/(-P[[:space:]]+)[^[:space:]]+/\1***REMOVIDO***/g'
-}
+MASKF="$TMPD/mascara.sed"
+cat > "$MASKF" <<'SEDEOF'
+s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
+s/(--?(password|passwd|pwd|senha|token|secret)[[:space:]]+)("[^"]*"|'[^']*'|[^-[:space:]][^[:space:]]*)/\1***REMOVIDO***/Ig
+s/(identified[[:space:]]+by[[:space:]]+)("[^"]*"|[^[:space:];]+)/\1***REMOVIDO***/Ig
+s#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g
+s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}@#\1/***REMOVIDO***@#g
+s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig
+s#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s/(sqlcmd[^|;]*[[:space:]]-P[[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/([[:space:]]-P[[:space:]]+)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1***REMOVIDO***/Ig
+s/(AKIA|ASIA)[0-9A-Z]{16}/\1***REMOVIDO***/g
+SEDEOF
+mask(){ sed -E -f "$MASKF"; }
 
 # Marcadores. SCR_RX: comando de clone/restore em script. LOG_RX: execucao em log.
 SCR_RX='duplicate[[:space:]]+(target[[:space:]]+)?database|from[[:space:]]+active[[:space:]]+database|restore[[:space:]]+(clone[[:space:]]+)?(primary[[:space:]]+)?(database|controlfile)|(^|[[:space:]/])impdp[[:space:]]|RESTORE[[:space:]]+DATABASE[[:space:]]'

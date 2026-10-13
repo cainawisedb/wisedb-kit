@@ -14,7 +14,20 @@
             6) GERA resultado_final.txt (colar na IA), resultado.json e .zip
  RISCO    : Zero. Somente leitura.
 
- COMPATIBILIDADE : PowerShell 2.0+ (Windows Server 2008 R2, 2012, 2012 R2, 2016+)
+ v2.3 (outubro/2026) - rodada de testes multiplataforma
+   [CRITICO]  Mascara de segredos igual a do Linux v3.7 (SENHA, KEY, aspas,
+              --password, -P do sqlcmd, user/senha@, Bearer, chave AWS). Pacote
+              exige confirmacao se sobrar segredo.
+   [CORRIGIDO] RESUMO nunca era gerado no Windows (digest usava os.uname).
+   [NOVO]     Oracle no Windows (modulo 10), instancias SQL nomeadas (modulo 04),
+              alerta para PostgreSQL, MySQL/MariaDB e Veeam Agent standalone.
+   [ALTERADO] RPO/RTO deixam de ser perguntados: A DEFINIR (igual ao Linux).
+   [NOVO]     escopo_wizard.txt (exclusoes/justificativas/alertas) vai ao RESUMO.
+   [CORRIGIDO] Modulos locais (modo offline) eram procurados na pasta de
+              trabalho; agora na pasta de onde o script foi chamado.
+   [CORRIGIDO] Requisito real declarado: PowerShell 3.0+ (WMF 3.0/5.1 no 2008 R2).
+
+ COMPATIBILIDADE : PowerShell 3.0+ (Windows Server 2008 R2 com WMF 3.0+, 2012, 2012 R2, 2016+)
             Compress-Archive (PS 5.0+) substituido por New-WiseZip, com cadeia
             de fallback: Compress-Archive -> System.IO.Compression.FileSystem
             (.NET 4.5) -> Shell.Application (COM, funciona em qualquer versao).
@@ -24,7 +37,14 @@
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
 
 $BaseUrl = if ($env:WISEDB_BASE_URL) { $env:WISEDB_BASE_URL } else { "https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main" }
-$Versao = "2.2"
+$Versao = "2.3"
+if ($PSVersionTable.PSVersion.Major -lt 3) {
+  Write-Host "ERRO: PowerShell $($PSVersionTable.PSVersion) detectado. O kit exige 3.0+." -ForegroundColor Red
+  Write-Host "Instale o WMF 5.1 (KB3191566) ou rode os modulos 04/06/07 manualmente." -ForegroundColor Red
+  exit 1
+}
+$OrigDir = (Get-Location).Path
+$Alertas = @()
 $Hostn = $env:COMPUTERNAME
 $Data = Get-Date -Format yyyyMMdd
 $Carimbo = Get-Date -Format 'yyyyMMdd_HHmm'
@@ -120,18 +140,33 @@ if (-not $EhAdmin) {
   Write-Host "        podem retornar vazio ou parcial. Isso sera registrado como pendencia." -ForegroundColor Yellow
 }
 
+function Svc($padrao) { @(Get-Service -Name $padrao -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' }) }
 $Det = [ordered]@{
   windows   = @{ on = $true;  desc = "Servidor Windows (Task Scheduler, discos, mapeamentos)" }
   sqlserver = @{ on = [bool](Get-Service -Name 'MSSQL*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running'); desc = "SQL Server (servico ativo)" }
   veeamvbr  = @{ on = [bool](Get-Service -Name 'VeeamBackupSvc' -ErrorAction SilentlyContinue); desc = "Veeam Backup & Replication (servidor)" }
   hyperv    = @{ on = [bool](Get-Service -Name 'vmms' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running'); desc = "Hyper-V (host)" }
   vmware    = @{ on = [bool](Get-Module -ListAvailable VMware.PowerCLI); desc = "VMware PowerCLI disponivel (coleta via vCenter)" }
+  oracle    = @{ on = [bool](Svc 'OracleService*'); desc = "Oracle Database (servico OracleService* ativo)" }
 }
 $Keys = @($Det.Keys)
 Write-Host "`nComponentes detectados automaticamente:"
 for ($i=0; $i -lt $Keys.Count; $i++) {
   $m = if ($Det[$Keys[$i]].on) { "[X]" } else { "[ ]" }
   Write-Host ("  {0}) {1} {2}" -f ($i+1), $m, $Det[$Keys[$i]].desc)
+}
+
+# Componentes sem coletor automatico: viram alerta e pendencia explicita, para a
+# IA nunca concluir "sem backup" por ausencia de evidencia.
+foreach ($x in @(@('postgresql*','PostgreSQL','pg_dump/pgBackRest/Barman e agendamento'),
+                 @('MySQL*','MySQL','mysqldump/xtrabackup e agendamento'),
+                 @('MariaDB*','MariaDB','mariadb-dump/mariabackup e agendamento'),
+                 @('VeeamEndpointBackupSvc','Veeam Agent for Windows (standalone)','job, destino e ultimos resultados do Agent (console ou print)'))) {
+  $sv = Svc $x[0]
+  if ($sv.Count -gt 0) {
+    $a = "$($x[1]) ativo ($(($sv | ForEach-Object { $_.Name }) -join ', ')) sem coletor automatico no kit: anexar manualmente $($x[2])"
+    $Alertas += $a; Write-Host "  ! $a" -ForegroundColor Yellow
+  }
 }
 
 #=========================== 2. WIZARD ==========================================
@@ -148,8 +183,8 @@ while ($true) {
   $Excluidos += [pscustomobject]@{ item = $item; justificativa = $just }
 }
 $Cliente = Read-Host "Nome do cliente"; if (-not $Cliente) { $Cliente = "NAO_INFORMADO" }
-$RPO = Read-Host "RPO acordado (ENTER se nao definido)"; if (-not $RPO) { $RPO = "A combinar com o cliente" }
-$RTO = Read-Host "RTO acordado (ENTER se nao definido)"; if (-not $RTO) { $RTO = "A combinar com o cliente" }
+# RPO/RTO acordados nao sao perguntados (igual ao Linux v3.6+): A DEFINIR, sem default.
+$RPO = "A DEFINIR"; $RTO = "A DEFINIR"
 $VCenter = ""
 if ($Det.vmware.on) { $VCenter = Read-Host "Endereco do vCenter (ENTER para pular VMware)" }
 
@@ -157,7 +192,8 @@ if ($Det.vmware.on) { $VCenter = Read-Host "Endereco do vCenter (ENTER para pula
 # no mesmo host e no mesmo dia, para clientes diferentes, nao se misturam mais.
 $ClienteSan = ($Cliente -replace '[\\/:*?"<>|]','_') -replace '\s+','_'
 $Work = Join-Path $BaseDir ("wisedb_coleta_{0}_{1}_{2}" -f $ClienteSan, $Hostn, $Carimbo)
-$Tmp = Join-Path $Work ".modulos"
+$Tmp = Join-Path ([IO.Path]::GetTempPath()) ("wisedb_mod_" + $PID)
+New-Item -ItemType Directory -Force -Path $Work | Out-Null
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 $Cliente | Out-File (Join-Path $Work ".cliente") -Encoding utf8
 Diga "Pasta de trabalho desta coleta: $Work"
@@ -165,8 +201,9 @@ Diga "Pasta de trabalho desta coleta: $Work"
 #=========================== 3. MODULOS + COLETA ================================
 function DL($m) {
   $dst = Join-Path $Tmp $m
-  if (Test-Path ".\kit_coleta_backup\$m") { Copy-Item ".\kit_coleta_backup\$m" $dst -Force }
-  elseif (Test-Path ".\$m") { Copy-Item ".\$m" $dst -Force }
+  $loc1 = Join-Path (Join-Path $OrigDir 'kit_coleta_backup') $m; $loc2 = Join-Path $OrigDir $m
+  if (Test-Path $loc1) { Copy-Item $loc1 $dst -Force }
+  elseif (Test-Path $loc2) { Copy-Item $loc2 $dst -Force }
   else {
     try { Invoke-WebRequest -Uri "$BaseUrl/$m" -OutFile $dst -UseBasicParsing -ErrorAction Stop }
     catch { Write-Host "ERRO: falha ao baixar $m de $BaseUrl" -ForegroundColor Red; Write-Host "  $($_.Exception.Message)" -ForegroundColor Red; return $null }
@@ -178,7 +215,12 @@ function Roda($nome, $mod, $args2) {
   $t0 = Get-Date
   Diga "Iniciando $nome"
   try {
+    $global:LASTEXITCODE = 0
     if ($args2 -and $args2.Count -gt 0) { & $mod @args2 } else { & $mod }
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "ERRO: $nome terminou com codigo $LASTEXITCODE (coleta parcial)" -ForegroundColor Red
+      $script:ModulosFalharam += "$nome(codigo $LASTEXITCODE)"
+    }
     Diga ("$nome concluido em {0}s" -f [int]((Get-Date) - $t0).TotalSeconds)
   } catch {
     Write-Host "ERRO durante $nome : $($_.Exception.Message)" -ForegroundColor Red
@@ -209,6 +251,11 @@ if ($Det.hyperv.on -or ($Det.vmware.on -and $VCenter)) {
   if ($mod) { Roda "modulo 07 (Hypervisor)" $mod @{ VCenter = $VCenter } }
   else { $ModulosFalharam += "07_coleta_hypervisor_windows.ps1(download)" }
 }
+if ($Det.oracle.on) {
+  $mod = DL "10_coleta_oracle_windows.ps1"
+  if ($mod) { Roda "modulo 10 (Oracle Windows)" $mod $null }
+  else { $ModulosFalharam += "10_coleta_oracle_windows.ps1(download)" }
+}
 Pop-Location
 
 # Registro explicito do nivel de privilegio, para quem le a politica saber se
@@ -227,11 +274,36 @@ $priv += "## Modulos com falha: $(if ($ModulosFalharam.Count -eq 0) {'nenhum'} e
 $priv | Out-File (Join-Path $Work "nivel_privilegio_coleta.txt") -Encoding utf8
 
 #=========================== 4. SANITIZACAO =====================================
+# Mesmas regras do wisedb_coleta_auto.sh v3.7 (a v2.2 nao cobria SENHA, KEY, aspas, -P, user/senha@).
 Diga "Sanitizando evidencias (remocao de segredos)"
-Get-ChildItem $Work -Recurse -Include *.txt,*.log,*.json | ForEach-Object {
-  $c = Get-Content $_.FullName -Raw
-  $c = $c -replace '(?i)((password|passwd|pwd|secret|token|apikey)\s*[=:]\s*)[^\s",]+', '$1***REMOVIDO***'
-  Set-Content $_.FullName $c -Encoding utf8
+$escopo = @("Cliente ............: $Cliente", "Modo da coleta .....: COMPLETA (Windows)", "Papel do host ......: HOST_DO_CLIENTE",
+            "Usuario / admin ....: $env:USERDOMAIN\$env:USERNAME / $(if ($EhAdmin) {'SIM'} else {'NAO'})",
+            "Coleta incompleta ..: $(if ($ModulosFalharam.Count) {'SIM (' + ($ModulosFalharam -join ', ') + ')'} else {'NAO'})",
+            "Fora do escopo (declarado pelo operador, NAO tratar como servico assegurado):")
+if ($Excluidos.Count -eq 0) { $escopo += "  (nenhum)" } else { $Excluidos | ForEach-Object { $escopo += "  - $($_.item) | Justificativa: $($_.justificativa)" } }
+$escopo += "Alertas do wizard:"
+if ($Alertas.Count -eq 0) { $escopo += "  (nenhum)" } else { $Alertas | ForEach-Object { $escopo += "  ! $_" } }
+$escopo | Out-File (Join-Path $Work "escopo_wizard.txt") -Encoding utf8
+
+function Protect-WiseText([string]$c) {
+  if ($null -eq $c) { return $c }
+  $c = $c -replace '((?:[A-Za-z0-9_.-]*)(?:password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key)["'']?\s*[=:]\s*)("[^"]*"|''[^'']*''|[^\s",;]+)', '$1***REMOVIDO***'
+  $c = $c -replace '(--?(?:password|passwd|pwd|senha|token|secret)\s+)("[^"]*"|''[^'']*''|[^-\s]\S*)', '$1***REMOVIDO***'
+  $c = $c -replace '(identified\s+by\s+)("[^"]*"|[^\s;]+)', '$1***REMOVIDO***'
+  $c = $c -replace '(//[^/:@\s]+:)[^@\s]+(@)', '$1***REMOVIDO***$2'
+  $c = $c -replace '([A-Za-z0-9_.$]+)/[^\s/@"''*]{2,}@', '$1/***REMOVIDO***@'
+  $c = $c -replace '([A-Za-z0-9_.$]+)/[^\s/@"''*]{2,}(\s+as\s+sys)', '$1/***REMOVIDO***$2'
+  $c = $c -replace '((?:connect|conn)\s+(?:(?:target|auxiliary|catalog)\s+)?["'']?[A-Za-z0-9_.$]+)/[^\s@"'']+', '$1/***REMOVIDO***'
+  $c = $c -creplace '(sqlcmd[^|;\r\n]*\s-P\s*)("[^"]*"|''[^'']*''|[^\s-]\S*)', '$1***REMOVIDO***'
+  $c = $c -creplace '(\s-P\s+)("[^"]*"|''[^'']*''|[^\s-]\S*)', '$1***REMOVIDO***'
+  $c = $c -replace '(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}', '$1***REMOVIDO***'
+  $c = $c -creplace '(AKIA|ASIA)[0-9A-Z]{16}', '$1***REMOVIDO***'
+  return $c
+}
+Get-ChildItem $Work -Recurse -Include *.txt,*.log,*.json,*.tsv,*.csv,*.ora,*.bat,*.cmd,*.ps1,*.sql | ForEach-Object {
+  $c = [IO.File]::ReadAllText($_.FullName)
+  $n = Protect-WiseText $c
+  if ($n -ne $c) { [IO.File]::WriteAllText($_.FullName, $n, (New-Object Text.UTF8Encoding($false))) }
 }
 
 #=========================== 5. CONSOLIDACAO ====================================
@@ -254,12 +326,12 @@ Get-ChildItem $Work -Recurse -Filter *.txt | Where-Object Name -ne 'resultado_fi
   Get-Content $_.FullName | Out-File $FinalTxt -Append -Encoding utf8
 }
 $Pendencias = @()
-if ($RPO -like 'A combinar*') { $Pendencias += "RPO nao definido formalmente" }
-if ($RTO -like 'A combinar*') { $Pendencias += "RTO nao definido formalmente" }
+$Pendencias += "RPO e RTO A DEFINIR com o cliente"
+$Alertas | ForEach-Object { $Pendencias += $_ }
 if (-not $EhAdmin) { $Pendencias += "Coleta sem privilegio administrativo: agendamentos e msdb podem estar parciais" }
 if ($ModulosFalharam.Count -gt 0) { $Pendencias += "Modulos com falha: $($ModulosFalharam -join ', ')" }
 [ordered]@{
-  schema = "wisedb.coleta.backup/v1"; cliente = $Cliente
+  schema = "wisedb.coleta.backup/v2"; cliente = $Cliente
   coleta = @{ host = $Hostn; data = (Get-Date -Format s); script_versao = $Versao; modo = "automatico"
               pasta = $Work; administrador = $EhAdmin
               powershell = $PSVersionTable.PSVersion.ToString(); so = [Environment]::OSVersion.VersionString }
@@ -273,7 +345,14 @@ if ($ModulosFalharam.Count -gt 0) { $Pendencias += "Modulos com falha: $($Modulo
 # ---- RESUMO COMPACTO (opcional: so quando ha Python neste host) --------------
 $Resumo = Join-Path $Work ("RESUMO_{0}_{1}.txt" -f $ClienteSan, $Hostn)
 $Py = $null
-foreach ($cand in @('python','python3','py')) { if (Test-Cmd $cand) { $Py = $cand; break } }
+# Valida que o interpretador roda de fato: o atalho da Microsoft Store (WindowsApps)
+# existe no PATH mas nao executa nada.
+foreach ($cand in @('py','python','python3')) {
+  if (Test-Cmd $cand) {
+    try { $v = (& $cand --version 2>&1 | Out-String); if ($LASTEXITCODE -eq 0 -and $v -match 'Python 3') { $Py = $cand; break } } catch { }
+  }
+}
+if (-not $Py) { Write-Host " AVISO: Python 3 indisponivel: RESUMO nao sera gerado aqui. Gere-o no bastion: python3 wisedb_digest.py <pasta> <cliente> HOST_DO_CLIENTE" -ForegroundColor Yellow }
 if ($Py) {
   $dg = DL "wisedb_digest.py"
   if ($dg) {
@@ -285,6 +364,8 @@ if ($Py) {
   }
 }
 
+Remove-Item $Tmp -Recurse -Force -ErrorAction SilentlyContinue
+
 #=========================== 6. RESUMO + OK =====================================
 Write-Host "`n=============================== RESUMO ================================"
 Write-Host " Cliente: $Cliente | Host: $Hostn"
@@ -293,21 +374,28 @@ Write-Host " Arquivos de evidencia: $((Get-ChildItem $Work -Recurse -Filter *.tx
 Write-Host " Fora do escopo: $($Excluidos.Count) item(ns) | RPO: $RPO | RTO: $RTO"
 Write-Host (" Tempo total: {0} min" -f [int]((Get-Date) - $Inicio).TotalMinutes)
 if ($ModulosFalharam.Count -gt 0) { Write-Host " Modulos com falha: $($ModulosFalharam -join ', ')" -ForegroundColor Yellow }
-$rest = Get-ChildItem $Work -Recurse -Filter *.txt -ErrorAction SilentlyContinue |
-  Select-String -Pattern 'password|passwd|secret|token' -ErrorAction SilentlyContinue |
-  Where-Object { $_.Line -notmatch 'REMOVIDO' } | Select-Object -First 5
-if ($rest) { Write-Host " ATENCAO - revisar antes de enviar:"; $rest | ForEach-Object { Write-Host "   $($_.Path):$($_.LineNumber)" } }
-else { Write-Host " Verificacao de segredos: nenhum remanescente" }
+$rest = @(Get-ChildItem $Work -Recurse -Include *.txt,*.log,*.json -ErrorAction SilentlyContinue |
+  Select-String -Pattern '(password|passwd|senha|secret|token|api_?key|access_?key)["'']?\s*[=:]\s*["'']?[^*\s"'']' -ErrorAction SilentlyContinue |
+  Where-Object { $_.Line -notmatch 'REMOVIDO' } | Select-Object -First 10)
 Write-Host "========================================================================"
-$ok = Read-Host "Gerar pacote final? (S/n)"
+if ($rest.Count -gt 0) {
+  Write-Host " POSSIVEL SEGREDO NAO MASCARADO ($($rest.Count) linha(s)):" -ForegroundColor Red
+  $rest | ForEach-Object { Write-Host "   $($_.Path.Replace($Work,'')):$($_.LineNumber)" }
+  $ok = Read-Host "Gerar o pacote MESMO ASSIM? (s/N)"
+  if ($ok -ne 's' -and $ok -ne 'S') { $ok = 'n' }
+} else {
+  Write-Host " Verificacao de segredos: nenhum remanescente"
+  $ok = Read-Host "Gerar pacote final? (S/n)"
+}
 if ($ok -ne 'n' -and $ok -ne 'N') {
   $zip = Join-Path $BaseDir ("wisedb_coleta_{0}_{1}_{2}.zip" -f $ClienteSan, $Hostn, $Carimbo)
   $gerado = New-WiseZip -SourceDir $Work -ZipPath $zip
   Write-Host "`nPRONTO."
   if ($gerado) { Write-Host "  1) Pacote completo : $zip" }
   else { Write-Host "  1) Pacote NAO gerado - compacte manualmente a pasta $Work" -ForegroundColor Yellow }
-  if (Test-Path $Resumo) { Write-Host "  2) COLE ISTO NA IA : $Resumo" }
+  if (Test-Path $Resumo) { Write-Host "  2) COLE ISTO NA IA : $Resumo" -ForegroundColor Green }
+  else { Write-Host "  2) RESUMO nao gerado: anexe o resultado_final.txt ou gere o RESUMO no bastion" -ForegroundColor Yellow }
   Write-Host "  3) Bruto completo  : $FinalTxt (+ resultado.json)"
-  Write-Host "  Cole o conteudo na IA junto com o Modelo_Politica_de_Backup_WiseDB.md"
-  Write-Host "  e o prompt Backup Policy Engineer para gerar a politica e o PDF."
+  Write-Host "  Anexe o RESUMO no Projeto 'Confeccao de politicas de backups' do Claude,"
+  Write-Host "  junto com o Painel e a politica anterior (ver Manual M-001 v2.0)."
 } else { Write-Host "Pacote nao gerado. Arquivos em $Work para revisao." }

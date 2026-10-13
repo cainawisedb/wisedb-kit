@@ -12,6 +12,9 @@
               powershell -ExecutionPolicy Bypass -File .\06_coleta_veeam_vbr.ps1
  SAIDA    : .\coleta_<hostname>_<data>\06_veeam\
 
+ v1.1 (outubro/2026): RetainDaysToKeep deixava de ser rotulado como retencao do
+            job (e o prazo de dados de VM removida); RetentionType exibido.
+
  NOTA     : Get-VBRBackupSession retorna TODO o historico antes de qualquer
             filtro. Em VBR com historico longo essa chamada custa minutos, por
             isso ela e feita UMA unica vez e reaproveitada pelos blocos.
@@ -73,7 +76,8 @@ Try-Block "JOBS DE BACKUP (tipo, agendamento, retencao, repositorio)" {
       Agendamento  = $_.ScheduleOptions.OptionsDaily.Kind.ToString() + ' ' + ($_.ScheduleOptions.OptionsDaily.TimeLocal)
       Periodico    = if($_.ScheduleOptions.OptionsPeriodically.Enabled){"$($_.ScheduleOptions.OptionsPeriodically.FullPeriod) min"}else{'-'}
       Retencao     = if($o.RetentionPolicy){"$($o.RetentionPolicy.Type) = $($o.RetentionPolicy.Count)"}
-                     else{"RetainCycles=$($o.BackupStorageOptions.RetainCycles) / RetainDays=$($o.BackupStorageOptions.RetainDaysToKeep)"}
+                     else{"$(if($o.BackupStorageOptions.RetentionType){$o.BackupStorageOptions.RetentionType}else{'Cycles'}) = $($o.BackupStorageOptions.RetainCycles) (pontos ou dias conforme o tipo)"}
+      RetencaoVMRemovida = "$($o.BackupStorageOptions.RetainDaysToKeep) dias (dados de VM excluida do job; NAO e a retencao do job)"
       GFS          = if($o.GfsPolicy -and $o.GfsPolicy.IsEnabled){'Sim (semanal/mensal/anual - ver JSON)'}else{'Nao'}
       Repositorio  = $_.GetTargetRepository().Name
       SinteticoFull= $o.BackupStorageOptions.EnableFullBackup
