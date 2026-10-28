@@ -1,6 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # 11_coleta_postgresql.sh - WiseDB | Kit de Coleta para Politica de Backup
+# v1.0.1 (outubro/2026): senha lida de terminal web/PAM vinha com CR no final.
 # v1.0 (outubro/2026)
 #
 # OBJETIVO : Coletar, por cluster PostgreSQL local, o que a politica precisa:
@@ -78,6 +79,7 @@ if [ -n "${WISEDB_PG_CONN:-}" ]; then
   if [ -z "${PGPASSWORD:-}" ] && { : > /dev/tty; } 2>/dev/null; then
     printf 'Senha do PostgreSQL para "%s" (ENTER se nao houver): ' "$WISEDB_PG_CONN" > /dev/tty
     IFS= read -rs PGPASSWORD < /dev/tty; echo > /dev/tty
+    PGPASSWORD="${PGPASSWORD%$'\r'}"
     [ -n "$PGPASSWORD" ] && export PGPASSWORD
   fi
 elif [ "$EU" = "postgres" ]; then

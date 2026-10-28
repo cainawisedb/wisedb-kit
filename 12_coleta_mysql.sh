@@ -1,6 +1,9 @@
 #!/bin/bash
 #===============================================================================
 # 12_coleta_mysql.sh - WiseDB | Kit de Coleta para Politica de Backup
+# v1.0.1 (outubro/2026): em terminal web/PAM (senhasegura) o ENTER do usuario
+#   chegava como CR+LF e o LF que sobrava respondia a senha em branco. Agora o
+#   buffer do terminal e descartado entre as perguntas e o CR e removido.
 # v1.0 (outubro/2026)
 #
 # OBJETIVO : Coletar, no MySQL/MariaDB local, o que a politica precisa:
@@ -73,10 +76,13 @@ declare -a DEST=()
 declare -a PRE=() USR=()
 MODO_CON=""
 testa(){ ${PRE[@]+"${PRE[@]}"} "$MYSQL" ${DEST[@]+"${DEST[@]}"} ${USR[@]+"${USR[@]}"} --connect-timeout=10 -N -B -e "SELECT 1" >/dev/null 2>&1; }
+# Descarta o que sobrou no terminal (LF do CR+LF de terminal web/PAM).
+limpa_tty(){ local _c _n=0; while [ "$_n" -lt 4096 ] && IFS= read -rsn1 -t 0.25 _c < /dev/tty 2>/dev/null; do _n=$((_n+1)); done; return 0; }
 pede_senha(){ # pede_senha <usuario>
   if [ -z "${MYSQL_PWD:-}" ] && { : > /dev/tty; } 2>/dev/null; then
     printf 'Senha do MySQL/MariaDB para "%s": ' "$1" > /dev/tty
-    IFS= read -rs MYSQL_PWD < /dev/tty; echo > /dev/tty
+    limpa_tty; IFS= read -rs MYSQL_PWD < /dev/tty; echo > /dev/tty
+    MYSQL_PWD="${MYSQL_PWD%$'\r'}"
   fi
   [ -n "${MYSQL_PWD:-}" ] && export MYSQL_PWD
 }
@@ -92,7 +98,7 @@ else
     MODO_CON="usuario atual $EU (~/.my.cnf ou unix_socket)"
   elif { : > /dev/tty; } 2>/dev/null; then
     printf 'Usuario de LEITURA do MySQL/MariaDB (ENTER para pular): ' > /dev/tty
-    IFS= read -r MU < /dev/tty
+    limpa_tty; IFS= read -r MU < /dev/tty; MU="${MU%$'\r'}"; limpa_tty
     if [ -n "$MU" ]; then USR=(--user="$MU"); pede_senha "$MU"; MODO_CON="usuario informado ($MU)"; fi
   fi
 fi

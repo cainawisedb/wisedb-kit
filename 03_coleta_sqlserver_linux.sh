@@ -14,6 +14,10 @@
 #            Modo nao interativo: exporte SQLCMDPASSWORD antes de chamar.
 # SAIDA    : ./coleta_<hostname>_<data>/03_sqlserver/
 #
+# Versao 1.2.1 (outubro/2026)
+#   [CORRIGIDO] Senha lida de terminal web/PAM (senhasegura) vinha com CR no
+#               final e o login falhava. CR removido.
+#
 # Versao 1.2 (outubro/2026)
 #   [NOVO]      Ultimo backup por base e tipo (lacuna de log = RPO real), checksum,
 #               backups danificados, copy_only, compressao, tipo de destino (VDI
@@ -53,7 +57,8 @@ fi
 if [ -z "${SQLCMDPASSWORD:-}" ]; then
   if [ "$TEM_TTY" = "1" ]; then
     printf '%s' "Senha de leitura do SQL Server ($USR): " >&9
-    read -rs SQLCMDPASSWORD < /dev/tty
+    IFS= read -rs SQLCMDPASSWORD < /dev/tty
+    SQLCMDPASSWORD="${SQLCMDPASSWORD%$'\r'}"
     diga ""
   else
     diga "ERRO: sem terminal para ler a senha. Exporte SQLCMDPASSWORD antes de executar."

@@ -46,6 +46,26 @@ Cuidado ao limpar a pasta do kit: as coletas são gravadas como `wisedb_coleta_<
 
 O antigo `wisedb-kit-offline.tar.gz` foi descontinuado (parou na v3.3, sem os módulos 08 a 12 e com a máscara antiga de segredos).
 
+### Servidor sem internet e sem transferência de arquivo (senhasegura)
+
+Quando o servidor só é acessível por PAM (ex.: Unimed JP via senhasegura), sem GitHub e sem WinSCP, o kit vai como **texto de colagem**: poucas linhas longas (base64), porque o senhasegura cola cerca de uma linha por segundo.
+
+1. Num Linux com o kit (bastion ou WSL), gere o texto: `bash gerar_colagem_senhasegura.sh` (kit completo, ~14 linhas). Para só atualizar um kit já instalado: `bash gerar_colagem_senhasegura.sh -p wisedb_coleta_auto.sh` (arquivos alterados).
+2. Abra o `.txt` gerado, copie tudo e cole na sessão do servidor, já logado com o usuário da coleta (ex.: oracle). Não digite nada até aparecer `[WiseDB] KIT OK` (ou `ERRO`, e então cole de novo).
+3. Rode a coleta: `cd ~/wisedb-kit && WISEDB_OFFLINE=1 bash wisedb_coleta_auto.sh`
+
+O kit fica em `~/wisedb-kit`; para outra pasta, digite `WK=/outra/pasta` antes de colar. As linhas da colagem não ficam no histórico do shell. Se a sessão cortar linhas longas, gere com linhas menores: `-l 4000`.
+
+### sudo (a partir da v4.0.1)
+
+O wizard não pergunta mais sobre sudo para usuário sem sinal de sudo (oracle, postgres e afins): segue sem sudo e registra `/etc/crontab`, `/etc/cron.d` e dbcli como pendência no RESUMO. sudo sem senha continua detectado sozinho. A pergunta (padrão **N**) só aparece para root, grupo wheel/sudo/admin ou usuário de nuvem (opc, ec2-user...). `WISEDB_SUDO=1` força a tentativa com senha; `WISEDB_SUDO=0` desliga. Motivo: a tentativa com senha negada gera "NOT in sudoers" no log de segurança do cliente.
+
+Para fechar a pendência sem sudo, peça à equipe de infraestrutura do cliente a saída de `crontab -l -u root; cat /etc/crontab; ls -l /etc/cron.d` e anexe ao RESUMO.
+
+### Terminal web/PAM (corrigido na v4.0.1)
+
+Até a v4.0, em terminal que envia CR+LF no ENTER (senhasegura e afins) os menus de instâncias Oracle e de diretórios eram confirmados sozinhos, com tudo incluído, e "não" na pergunta de sudo era lido como sim. A v4.0.1 descarta o que sobra no terminal a cada pergunta e aceita s/sim/n/não em qualquer grafia. Nos menus de múltipla escolha, ENTER sem marcar nada continua significando **todas**.
+
 ### Vulnerabilidades e inconformidades (módulo 13, a partir da v4.0)
 
 Toda coleta completa com coleta local roda o módulo 13 (`13_coleta_seguranca_conformidade.sh` no Linux, `13_coleta_seguranca_windows.ps1` no Windows). Somente leitura; nenhum valor de senha é lido ou gravado. **Rode o kit no servidor de banco e também no servidor/repositório de backup**: cada lado enxerga riscos diferentes.

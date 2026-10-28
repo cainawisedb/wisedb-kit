@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
-# v4.0 - Wizard blindado + multicloud + restauracao + modo local + seguranca/conformidade
+# v4.0.1 - Wizard blindado + multicloud + restauracao + modo local + seguranca/conformidade
 #
 # USO (com acesso ao GitHub):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main/wisedb_coleta_auto.sh)
@@ -23,6 +23,25 @@
 #   tenancy escolhida entra como evidencia do cliente.
 #
 # RISCO: Zero no ambiente. Somente leitura.
+#
+# v4.0.1 (outubro/2026) - wizard estavel em terminal web/PAM (senhasegura)
+#   [CRITICO]   Menus de instancias Oracle e de diretorios eram pulados sozinhos.
+#               Causa: terminal web/PAM envia CR+LF no ENTER; o caractere que
+#               sobrava no buffer confirmava o menu seguinte com nada marcado
+#               (= todas as instancias / todos os diretorios). O wizard agora
+#               descarta o que sobra no terminal antes e depois de cada pergunta
+#               e de cada menu, e aceita CR como ENTER.
+#   [CORRIGIDO] "nao"/"não" na pergunta de sudo era lido como SIM (so "N" exato
+#               valia) e disparava sudo -v pedindo senha. Todas as respostas
+#               s/n aceitam s, sim, y, yes / n, nao, não, no, com CR removido.
+#   [ALTERADO]  sudo: sem pergunta para usuario sem sinal de sudo (oracle,
+#               postgres etc.). sudo sem senha continua detectado sozinho; sudo
+#               COM senha so e oferecido a root, grupo wheel/sudo/admin, usuario
+#               de nuvem (opc, ec2-user...) ou com WISEDB_SUDO=1; WISEDB_SUDO=0
+#               desliga. Evita "NOT in sudoers" no log de seguranca do cliente.
+#               Com sudo por senha, o ticket e renovado
+#               durante a coleta (antes expirava em 5 min e os modulos finais
+#               perdiam o sudo).
 #
 # v4.0 (outubro/2026) - vulnerabilidades e inconformidades na politica
 #   [NOVO]      Modulo 13 (seguranca e conformidade) roda em toda coleta completa
@@ -167,7 +186,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main}"
-VERSAO="4.0"
+VERSAO="4.0.1"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -178,7 +197,9 @@ ORIG_DIR="$(pwd)"
 # mesmo host e no mesmo dia. Os modulos baixados vivem num temporario proprio.
 WORK=""
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/wisedb_mod.XXXXXX") || { echo "Falha ao criar temporario"; exit 1; }
-trap 'rm -rf "$TMP" 2>/dev/null' EXIT
+SUDO_KA=""
+fim_wisedb(){ rm -rf "$TMP" 2>/dev/null; [ -n "$SUDO_KA" ] && kill "$SUDO_KA" 2>/dev/null; return 0; }
+trap fim_wisedb EXIT
 
 #---------------------------- UI: cores e helpers -------------------------------
 if [ -t 1 ] || [ -e /dev/tty ]; then
@@ -301,12 +322,32 @@ wisedb_download(){
   wisedb_curl "$BASE_URL/$module" -o "$dest"
 }
 
+# Descarta o que sobrou no buffer do terminal. Terminal web/PAM (senhasegura,
+# Guacamole e afins) envia CR+LF no ENTER: o LF que sobrava confirmava sozinho o
+# menu seguinte com nada marcado (causa dos menus pulados ate a v4.0).
+limpa_tty(){
+  [ "$INTER" = "1" ] || return 0
+  local _c _n=0
+  while [ "$_n" -lt 4096 ] && IFS= read -rsn1 -t "${WISEDB_TTY_FLUSH:-0.25}" _c < "$TTY" 2>/dev/null; do
+    _n=$((_n+1))
+  done
+  return 0
+}
+# Respostas s/n: s, sim, y, yes / n, nao, não, no (maiusculas ou minusculas).
+eh_sim(){ case "$(printf '%s' "${1:-}" | tr -d '[:space:]')" in [sSyY]*) return 0;; esac; return 1; }
+eh_nao(){ case "$(printf '%s' "${1:-}" | tr -d '[:space:]')" in [nN]*) return 0;; esac; return 1; }
+
 pergunta(){ # pergunta "label" var "default"
   local label="$1" var="$2" def="${3:-}" resp=""
   if [ "$INTER" = "1" ]; then
+    limpa_tty
     printf "%b" "  ${LAR}?${R} ${NEG}$label${R}${def:+ ${DIM}[$def]${R}}: " > "$TTY"
     IFS= read -r resp < "$TTY"
+    limpa_tty
   fi
+  # CR do terminal e espacos nas pontas nao fazem parte da resposta
+  resp="${resp//$'\r'/}"
+  resp="${resp#"${resp%%[![:space:]]*}"}"; resp="${resp%"${resp##*[![:space:]]}"}"
   [ -z "$resp" ] && resp="$def"
   printf -v "$var" '%s' "$resp"
 }
@@ -320,6 +361,7 @@ menu_sel(){ # menu_sel single|multi "titulo" item...
   MENU_SEL=()
   [ "$n" -eq 0 ] && return 0
   if [ "$INTER" = "0" ]; then [ "$modo" = "single" ] && MENU_SEL=(0); return 0; fi
+  limpa_tty
   while :; do
     {
       printf "\n  ${NEG}%s${R}\n" "$tit"
@@ -342,19 +384,20 @@ menu_sel(){ # menu_sel single|multi "titulo" item...
     local k rest
     IFS= read -rsn1 k < "$TTY"
     case "$k" in
-      $'\033') IFS= read -rsn2 -t 0.1 rest < "$TTY" || rest=""
-               case "$rest" in "[A") [ "$cur" -gt 0 ] && cur=$((cur-1));; "[B") [ "$cur" -lt $((n-1)) ] && cur=$((cur+1));; esac;;
+      $'\033') IFS= read -rsn2 -t 0.3 rest < "$TTY" || rest=""
+               case "$rest" in "[A"|"OA") [ "$cur" -gt 0 ] && cur=$((cur-1));; "[B"|"OB") [ "$cur" -lt $((n-1)) ] && cur=$((cur+1));; esac;;
       k|K) [ "$cur" -gt 0 ] && cur=$((cur-1));;
       j|J) [ "$cur" -lt $((n-1)) ] && cur=$((cur+1));;
       " ") [ "$modo" = "multi" ] && marc[cur]=$((1-marc[cur]));;
       a|A) [ "$modo" = "multi" ] && for ((i=0;i<n;i++)); do marc[i]=1; done;;
       n|N) [ "$modo" = "multi" ] && for ((i=0;i<n;i++)); do marc[i]=0; done;;
-      ""|$'\n')
+      ""|$'\n'|$'\r')
+        limpa_tty
         if [ "$modo" = "single" ]; then MENU_SEL=("$cur"); return 0
         else for ((i=0;i<n;i++)); do [ "${marc[i]}" = "1" ] && MENU_SEL+=("$i"); done; return 0; fi;;
       [0-9]) local idx=$((k-1))
              if [ "$idx" -ge 0 ] && [ "$idx" -lt "$n" ]; then
-               if [ "$modo" = "single" ]; then MENU_SEL=("$idx"); return 0
+               if [ "$modo" = "single" ]; then limpa_tty; MENU_SEL=("$idx"); return 0
                else marc[idx]=$((1-marc[idx])); fi
              fi;;
     esac
@@ -792,29 +835,51 @@ done
 ok "Pasta de trabalho desta coleta: $(basename "$WORK")"
 
 #-------------------------------------------------------------------------------
-# Elevacao opcional. Sem sudo, /etc/crontab e /etc/cron.d ficam ilegiveis para
-# oracle e o dbcli nao roda: o agendador do backup fisico do DB System nunca e
-# comprovado e a politica registra o agendador como INFERIDO.
+# Elevacao (v4.0.1). Sem sudo, /etc/crontab e /etc/cron.d ficam ilegiveis para
+# oracle e o dbcli nao roda: o agendador do backup fisico fica como pendencia.
+# Regra: sudo sem senha (sudo -n) e testado sempre, sem interacao. Sudo COM senha
+# so e perguntado se houver sinal de sudo (root, grupo wheel/sudo/admin, usuario
+# de nuvem). oracle e postgres quase nunca tem: a pergunta so atrasava, e a
+# tentativa com senha negada gera "user NOT in sudoers" no log (e e-mail) de
+# seguranca do cliente. No senhasegura a senha do usuario nem e conhecida.
+#   WISEDB_SUDO=1 forca a tentativa com senha
+#   WISEDB_SUDO=0 nunca usa sudo
 #-------------------------------------------------------------------------------
+SUDO_PEDIDO="${WISEDB_SUDO:-auto}"
 WISEDB_SUDO=0
-if command -v sudo >/dev/null 2>&1; then
-  if sudo -n true 2>/dev/null; then
-    WISEDB_SUDO=1
-    ok "sudo sem senha disponivel: cron de sistema e dbcli serao coletados"
-  else
-    pergunta "Usar sudo para ler cron de sistema e dbcli? Pode pedir senha (S/n)" USESUDO "S"
-    if [ "${USESUDO^^}" != "N" ]; then
-      if sudo -v 2>/dev/null && sudo -n true 2>/dev/null; then
-        WISEDB_SUDO=1; ok "sudo validado"
-      else
-        warn "sudo indisponivel: cron de sistema e dbcli nao serao coletados; agendador do backup fisico ficara como pendencia"
-      fi
-    else
-      warn "Coleta sem sudo por escolha do operador: cron de sistema e dbcli ficarao como pendencia"
-    fi
-  fi
-else
+tem_sinal_sudo(){
+  id -nG 2>/dev/null | tr ' ' '\n' | grep -qxE 'wheel|sudo|admin' && return 0
+  case "$(whoami)" in opc|ec2-user|ubuntu|cloud-user|centos|azureuser|admin) return 0;; esac
+  return 1
+}
+if [ "$(id -u)" = "0" ]; then
+  WISEDB_SUDO=1; ok "Executando como root: cron de sistema e dbcli serao coletados"
+elif [ "$SUDO_PEDIDO" = "0" ]; then
+  warn "Coleta sem sudo (WISEDB_SUDO=0): cron de sistema e dbcli ficarao como pendencia"
+elif ! command -v sudo >/dev/null 2>&1; then
   warn "sudo nao instalado: cron de sistema e dbcli nao serao coletados"
+elif sudo -n true 2>/dev/null; then
+  WISEDB_SUDO=1; ok "sudo sem senha disponivel: cron de sistema e dbcli serao coletados"
+elif [ "$SUDO_PEDIDO" != "1" ] && ! tem_sinal_sudo; then
+  warn "Usuario $(whoami) sem sudo: cron de sistema e dbcli ficarao como pendencia (para tentar sudo com senha: WISEDB_SUDO=1)"
+else
+  USESUDO="S"
+  [ "$SUDO_PEDIDO" = "1" ] || pergunta "Usuario $(whoami) pode ter sudo COM senha. Usar sudo para ler cron de sistema e dbcli? (s/N)" USESUDO "N"
+  if eh_sim "$USESUDO"; then
+    limpa_tty
+    if sudo -v && sudo -n true 2>/dev/null; then
+      WISEDB_SUDO=1; ok "sudo validado"
+      # Renova o ticket durante a coleta: com timestamp_timeout padrao (5 min)
+      # os modulos finais (09, 13) perdiam o sudo no meio da execucao.
+      ( while sleep 60; do sudo -n -v 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
+      SUDO_KA=$!
+    else
+      warn "sudo nao validado: cron de sistema e dbcli nao serao coletados; agendador do backup fisico ficara como pendencia"
+    fi
+    limpa_tty
+  else
+    warn "Coleta sem sudo por escolha do operador: cron de sistema e dbcli ficarao como pendencia"
+  fi
 fi
 export WISEDB_SUDO
 export WISEDB_LIST_DEPTH="${WISEDB_LIST_DEPTH:-4}"
@@ -829,7 +894,7 @@ OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; SQL_USER=""
 if [ "$MODO" = "COMPLETA" ]; then
 if [ "$COLETA_LOCAL" = "1" ] && [ ${#ORA_SIDS[@]} -gt 0 ]; then
   disp=(); for s in "${ORA_SIDS[@]}"; do disp+=("${NEG}${s%%|*}${R}  ${DIM}${s##*|}${R}"); done
-  menu_sel multi "Instancias Oracle a INCLUIR (ESPACO marca, 'a' = todas)" "${disp[@]}"
+  menu_sel multi "Instancias Oracle a INCLUIR (ESPACO marca, ENTER sem marcar = todas)" "${disp[@]}"
   if [ ${#MENU_SEL[@]} -eq 0 ]; then
     warn "Nenhuma marcada: todas serao coletadas"
     for s in "${ORA_SIDS[@]}"; do ORA_SEL+=("${s%%|*}"); done
@@ -839,7 +904,7 @@ if [ "$COLETA_LOCAL" = "1" ] && [ ${#ORA_SIDS[@]} -gt 0 ]; then
   ok "Oracle no escopo: ${ORA_SEL[*]}"
 fi
 if [ "$COLETA_LOCAL" = "1" ] && [ ${#DIR_CAND[@]} -gt 0 ]; then
-  menu_sel multi "Diretorios de backup a inventariar ('a' = todos)" "${DIR_CAND[@]}"
+  menu_sel multi "Diretorios de backup a inventariar (ESPACO marca, ENTER sem marcar = todos)" "${DIR_CAND[@]}"
   if [ ${#MENU_SEL[@]} -eq 0 ]; then DIR_SEL=("${DIR_CAND[@]}")
   else for i in "${MENU_SEL[@]}"; do DIR_SEL+=("${DIR_CAND[i]}"); done; fi
 fi
@@ -864,7 +929,7 @@ if [ ${#OCI_PROF[@]} -gt 0 ]; then
       else
         warn "DIVERGENCIA: esta VM esta na tenancy ...${VM_TENANCY: -12} e o profile aponta para ...${OCI_SEL_TEN: -12}"
         pergunta "Confirma que o profile e do cliente '$CLIENTE'? (s/N)" CONF "N"
-        [ "${CONF^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada por divergencia de tenancy"; }
+        eh_sim "$CONF" || { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada por divergencia de tenancy"; }
       fi
     fi
     if [ -n "$OCI_SEL_PROF" ] && ! casa_cliente "$OCI_SEL_PROF"; then
@@ -873,7 +938,7 @@ if [ ${#OCI_PROF[@]} -gt 0 ]; then
       else
         warn "O profile '$OCI_SEL_PROF' nao lembra o nome '$CLIENTE' e ha ${#OCI_PROF[@]} profiles neste host"
         pergunta "Prosseguir com este profile? (s/N)" CONF2 "N"
-        [ "${CONF2^^}" != "S" ] && { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada pelo operador"; }
+        eh_sim "$CONF2" || { OCI_SEL_PROF=""; OCI_SEL_TEN=""; OCI_SEL_REG=""; warn "Coleta OCI cancelada pelo operador"; }
       fi
     fi
     if [ -n "$OCI_SEL_PROF" ]; then
@@ -925,7 +990,7 @@ if [ "$CLOUD_ALVOS" -gt 0 ]; then
       if ! casa_cliente "$id" && ! casa_cliente "${extra:-}"; then
         warn "$prov '$id' nao lembra o nome '$CLIENTE'"
         pergunta "Confirma que '$id' e do cliente '$CLIENTE'? (s/N)" CONF3 "N"
-        [ "${CONF3^^}" = "S" ] || { warn "Alvo $prov '$id' descartado pelo operador"; continue; }
+        eh_sim "$CONF3" || { warn "Alvo $prov '$id' descartado pelo operador"; continue; }
       fi
       case "$prov" in
         AWS)
@@ -971,12 +1036,12 @@ fi
 PG_SEL=0; MY_SEL=0
 if [ "$COLETA_LOCAL" = "1" ] && [ "$PG_ON" = "1" ]; then
   pergunta "PostgreSQL deste host pertence ao cliente e entra na politica? (S/n)" RPG "S"
-  if [ "${RPG^^}" = "N" ]; then info "PostgreSQL marcado como fora do escopo"; EXCL+=("PostgreSQL local de $HOSTN|Declarado pelo operador como base de ferramenta / fora do escopo")
+  if eh_nao "$RPG"; then info "PostgreSQL marcado como fora do escopo"; EXCL+=("PostgreSQL local de $HOSTN|Declarado pelo operador como base de ferramenta / fora do escopo")
   else PG_SEL=1; ok "PostgreSQL no escopo (modulo 11)"; fi
 fi
 if [ "$COLETA_LOCAL" = "1" ] && [ "$MY_ON" = "1" ]; then
   pergunta "MySQL/MariaDB deste host pertence ao cliente e entra na politica? (S/n)" RMY "S"
-  if [ "${RMY^^}" = "N" ]; then info "MySQL/MariaDB marcado como fora do escopo"; EXCL+=("MySQL/MariaDB local de $HOSTN|Declarado pelo operador como base de ferramenta / fora do escopo")
+  if eh_nao "$RMY"; then info "MySQL/MariaDB marcado como fora do escopo"; EXCL+=("MySQL/MariaDB local de $HOSTN|Declarado pelo operador como base de ferramenta / fora do escopo")
   else MY_SEL=1; ok "MySQL/MariaDB no escopo (modulo 12)"; fi
 fi
 
@@ -1052,7 +1117,7 @@ if [ ${#ALERTAS[@]} -gt 0 ]; then
   say "  ${AMAR}Alertas: ${#ALERTAS[@]}${R}"; for a in "${ALERTAS[@]}"; do info "  ! $a"; done
 fi
 pergunta "Executar a coleta com este plano? (S/n)" GO "S"
-[ "${GO^^}" = "N" ] && { erro "Coleta cancelada."; exit 0; }
+eh_nao "$GO" && { erro "Coleta cancelada."; exit 0; }
 
 #===============================================================================
 # FASE 6 - COLETA
@@ -1384,13 +1449,13 @@ if [ "${SEG_N:-0}" -gt 0 ]; then
   head -10 "$WORK/.segredos_remanescentes" | sed "s|$WORK/||" | while IFS= read -r l; do info "  $l"; done
   info "Revise/edite esses arquivos antes de enviar. O pacote so e gerado com confirmacao explicita."
   pergunta "Gerar o pacote MESMO ASSIM? (s/N)" OKF "N"
-  [ "${OKF^^}" = "S" ] || OKF="N"
+  eh_sim "$OKF" || OKF="N"
 else
   info "Segredos remanescentes: nenhum"
   pergunta "Gerar pacote final? (S/n)" OKF "S"
 fi
 rm -f "$WORK/.segredos_remanescentes"
-if [ "${OKF^^}" != "N" ]; then
+if ! eh_nao "$OKF"; then
   PAC="$ORIG_DIR/$(basename "$WORK").tar.gz"
   tar -czf "$PAC" -C "$ORIG_DIR" "$(basename "$WORK")"
   say ""
