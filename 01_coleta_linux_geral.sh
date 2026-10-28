@@ -11,6 +11,11 @@
 #              bash 01_coleta_linux_geral.sh [dir_backup_1] [dir_backup_2] ...
 # SAIDA    : ./coleta_<hostname>_<data>/01_linux/
 #
+# Versao 1.2 (outubro/2026)
+#   [CORRIGIDO] "df -hT" sem timeout travava a coleta inteira quando havia
+#               montagem NFS/CIFS morta (destino de backup fora do ar). Agora
+#               tem teto de 30s e o travamento vira aviso no arquivo.
+#
 # Versao 1.1 (setembro/2026)
 #   [CORRIGIDO] "du -sh --max-depth=2" tem flags mutuamente exclusivas e falhava
 #               sempre. Passa a usar "du -h --max-depth=2" com timeout, para nao
@@ -119,7 +124,11 @@ run "Uptime"                     uptime
 run "Data/hora e timezone"       timedatectl
 
 # --- Armazenamento e pontos de montagem (destinos de backup) ------------------
-run "Filesystems e uso de disco" df -hT
+if command -v timeout >/dev/null 2>&1; then
+  run "Filesystems e uso de disco" sh -c "timeout -k 5 30 df -hT || { echo '[AVISO] df interrompido (timeout de 30s): possivel montagem NFS/CIFS sem resposta. Somente filesystems locais abaixo:'; timeout -k 5 30 df -hTl; }"
+else
+  run "Filesystems e uso de disco" df -hT
+fi
 run "Pontos de montagem NFS/CIFS" sh -c "mount | grep -Ei 'nfs|cifs|smb' || echo 'Nenhum mount NFS/CIFS ativo'"
 run "fstab (mounts persistentes)" cat /etc/fstab
 

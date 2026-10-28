@@ -6,8 +6,7 @@ Publique este kit em um repositório (GitHub, por exemplo) e rode UMA linha no s
 
 ```bash
 # Linux (usuario oracle ou dono das rotinas):
-export WISEDB_BASE_URL="https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main"
-bash <(curl -fsSL "$WISEDB_BASE_URL/wisedb_coleta_auto.sh")
+bash <(curl -fsSL https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main/wisedb_coleta_auto.sh)
 # So se aparecer "curl: (60)" (CA antiga): troque curl -fsSL por curl -kfsSL
 ```
 ```powershell
@@ -19,15 +18,51 @@ powershell -ExecutionPolicy Bypass -File ".\wisedb_coleta_auto.ps1"
 ```
 Manual completo do fluxo para colaboradores: M-001 v2.0.
 
-### Ambiente sem internet (ex.: acesso só por PAM/senhasegura)
+### Ambiente sem internet (VPN, PAM/senhasegura, firewall)
 
-Não use o `wisedb-kit-offline.tar.gz`: ele parou na v3.3 (setembro/2026), não tem os módulos 08 a 12 e usa a máscara antiga de segredos (a que deixou passar o `OCI_TOKEN`). Baixe o repositório atual pelo botão **Code > Download ZIP** do GitHub, leve os arquivos para uma pasta do servidor e rode de dentro dela:
+Baixe o repositório atual pelo botão **Code > Download ZIP** do GitHub, leve a pasta inteira para o servidor e rode de dentro dela:
 
 ```bash
 cd /caminho/da/pasta/do/kit && bash wisedb_coleta_auto.sh
 ```
+```powershell
+cd C:\caminho\do\kit; powershell -ExecutionPolicy Bypass -File .\wisedb_coleta_auto.ps1
+```
 
-O orquestrador usa os módulos da própria pasta (eles têm prioridade sobre o download). O aviso "Nao foi possivel baixar modulos" é esperado nesse modo e não afeta a coleta.
+A partir da v3.9 (Linux) e v2.5 (Windows), o orquestrador identifica a origem dos módulos logo após a linha `Host:` e mostra na tela:
+
+| Como foi chamado | Origem | Comportamento |
+|---|---|---|
+| Arquivo dentro da pasta do kit | `LOCAL` | Usa só os arquivos da pasta. Nenhum acesso à rede para buscar módulos. |
+| Link (`bash <(curl ...)`, `irm \| iex` ou bootstrap) com GitHub acessível | `GITHUB` | Baixa os módulos na mesma versão do orquestrador. |
+| Link, GitHub sem resposta, com cópia local na pasta atual ou em `./kit_coleta_backup` | `LOCAL` | Cai para a cópia local em no máximo ~20 s. |
+| Link, GitHub sem resposta e sem cópia local | aborta | Encerra em segundos com a instrução acima. |
+
+Até a v3.8 o teste de acesso ao GitHub não tinha timeout: em rede que descarta pacotes, a tela parava logo após `Host: ... | Usuario: ...`. Se encontrar um servidor ainda com a v3.8, o contorno sem trocar arquivos é rodar dentro da pasta do kit: `WISEDB_BASE_URL=http://127.0.0.1:9 bash wisedb_coleta_auto.sh`.
+
+Variáveis úteis: `WISEDB_OFFLINE=1` força o modo local; `WISEDB_KIT_DIR=/caminho` aponta a pasta do kit; `WISEDB_NET_TIMEOUT` (padrão 20 s) limita o teste de acesso ao GitHub. A origem usada fica registrada em `nivel_privilegio_coleta.txt` e no `resultado.json` (`coleta.origem_modulos`).
+
+Cuidado ao limpar a pasta do kit: as coletas são gravadas como `wisedb_coleta_<cliente>_...`, e um `rm wisedb_coleta_*` apaga junto os orquestradores (`wisedb_coleta_auto.sh/.ps1` e o bootstrap). Apague pelo nome completo da pasta da coleta.
+
+O antigo `wisedb-kit-offline.tar.gz` foi descontinuado (parou na v3.3, sem os módulos 08 a 12 e com a máscara antiga de segredos).
+
+### Vulnerabilidades e inconformidades (módulo 13, a partir da v4.0)
+
+Toda coleta completa com coleta local roda o módulo 13 (`13_coleta_seguranca_conformidade.sh` no Linux, `13_coleta_seguranca_windows.ps1` no Windows). Somente leitura; nenhum valor de senha é lido ou gravado. **Rode o kit no servidor de banco e também no servidor/repositório de backup**: cada lado enxerga riscos diferentes.
+
+| Lado | O que é verificado |
+|---|---|
+| Servidor de banco | Repositório de backup (NFS/CIFS/unidade mapeada) montado com escrita permanente; NFS soft, sec=sys, wsize baixo, sem dNFS; backup no mesmo filesystem dos dados; permissões de diretórios e dumps; credencial de off-site no servidor de produção |
+| Oracle (por instância) | NOARCHIVELOG, retenção (REDUNDANCY 1, janela curta), quantidade de fulls disponíveis, full antigo, janela de backup, falhas, ausência de VALIDATE, criptografia, autobackup de controlfile, BCT (EE), FRA, atraso de archivelog, versão fora de suporte |
+| Scripts do cron | Exclusão do backup anterior antes do novo full (ambiente sem backup durante a janela) |
+| Servidor de backup | Exports NFS abertos (`*` ou rede ampla), `no_root_squash`, `insecure`, `sec=sys`; imutabilidade (atributo imutável, Veeam Hardened Repository), snapshots e deduplicação |
+| Ambos | SO fora de suporte, dias sem atualização, firewall, SSH (root/senha), SELinux, auditd, NTP, antivírus/EDR; no Windows também SMBv1, RDP sem NLA, shares e pastas de backup com escrita para Todos/Usuários |
+
+O digest 2.6 consolida tudo em uma matriz única (IDs `VUL-xxx`), junto com os alertas existentes e os critérios 3-2-1-1-0 não atendidos, e gera:
+
+- seção **VULNERABILIDADES E INCONFORMIDADES** no RESUMO (vai para a política, seção 9);
+- `MATRIZ_VULNERABILIDADES.tsv` (abre no Excel; base para o Painel);
+- seção **INSUMO COMERCIAL** no RESUMO e `OPORTUNIDADES_COMERCIAIS_INTERNO.txt`: achados agrupados por oportunidade de adequação, com prioridade (P1 a P4) e solução de referência. **Uso interno, não enviar ao cliente.**
 
 Para apontar outro repositório sem editar o script: `export WISEDB_BASE_URL="https://.../kit_coleta_backup"` antes de rodar (Linux) ou `$env:WISEDB_BASE_URL = "..."` (Windows). Repositório privado funciona incluindo o token de leitura na URL raw.
 

@@ -10,6 +10,15 @@ Os arquivos brutos completos permanecem no pacote .tar.gz.
 Uso: python3 wisedb_digest.py <pasta_coleta> <cliente> <papel_host> [saida]
 Compativel com Python 3.6+ (sem f-strings aninhadas).
 
+Versao 2.6 (outubro/2026)
+  [NOVO]      VULNERABILIDADES E INCONFORMIDADES: matriz unica com ID estavel
+              (VUL-xxx), severidade, categoria, pilar 3-2-1-1-0, evidencia,
+              impacto e acao. Consolida o modulo 13 (Linux/Windows, todos os
+              hosts do pacote), os alertas automaticos com mapeamento conhecido
+              e os criterios 3-2-1-1-0 nao atendidos, sem repetir a mesma chave.
+  [NOVO]      INSUMO COMERCIAL (interno): achados agrupados por oportunidade de
+              adequacao, com prioridade e solucao de referencia. Arquivos
+              MATRIZ_VULNERABILIDADES.tsv e OPORTUNIDADES_COMERCIAIS_INTERNO.txt.
 Versao 2.5 (outubro/2026)
   [NOVO]      Secoes POSTGRESQL (modulo 11), MYSQL/MARIADB (modulo 12) e NUVEM
               (AWS/GCP/Azure, modulo 08), que antes nao entravam no RESUMO.
@@ -1591,6 +1600,196 @@ for k in ("COPIAS", "MIDIAS", "OFFSITE", "IMUTAVEL", "TESTES", "LOGICO"):
     for x in a[:4]: add("      + " + x[:104])
     for x in c[:4]: add("      - " + x[:104])
 
+# ===================== 5f. VULNERABILIDADES E INCONFORMIDADES (v2.6) ========
+# Consolida: (1) achados do modulo 13 (Linux/Windows, todos os hosts do pacote),
+# (2) alertas deste digest com mapeamento conhecido e (3) criterios 3-2-1-1-0
+# nao atendidos. Cada achado tem chave estavel; a mesma chave nao se repete a
+# partir de fontes diferentes. Severidade: CRITICO > ALTO > MEDIO > BAIXO > INFO.
+SEV_ORD = {"CRITICO": 0, "ALTO": 1, "MEDIO": 2, "BAIXO": 3, "INFO": 4}
+SEV_BAIXA = {"CRITICO": "ALTO", "ALTO": "MEDIO", "MEDIO": "BAIXO", "BAIXO": "INFO", "INFO": "INFO"}
+OPP = {
+ "IMUTAVEL": ("Copia imutavel / air-gapped (protecao contra ransomware)",
+              "Repositorio com retencao bloqueada: Veeam Hardened Repository, ExaGrid Retention Time-Lock, "
+              "OCI Object Storage com retention rule travada ou AWS S3 Object Lock"),
+ "OFFSITE": ("Copia off-site e recuperacao de desastre",
+             "OCI Object Storage / Autonomous Recovery Service ou AWS S3 em outra regiao; standby com Data Guard (EE) "
+             "ou Dbvisit Standby (SE2); replicacao de servidores com Rackware"),
+ "REPOSITORIO": ("Repositorio de backup dedicado, com capacidade e retencao adequadas",
+                 "Appliance ExaGrid ou storage dedicado (Dell, HP, IBM), consolidacao com Nutanix, rede de backup isolada"),
+ "SEGMENTACAO": ("Segmentacao de rede e hardening dos servidores de banco e backup",
+                 "Fortinet (firewall e segmentacao da rede de backup), hardening de SO, acesso nominal e auditoria"),
+ "CICLO_VIDA": ("Atualizacao de sistema operacional e banco fora de suporte",
+                "Upgrade para Oracle Database 19c e SO suportado; avaliacao de migracao para OCI"),
+ "DESEMPENHO": ("Reducao da janela de backup e do tempo de recuperacao (RTO)",
+                "Tuning de RMAN (BCT, paralelismo, compressao, dNFS), rede dedicada e appliance de backup"),
+ "TESTES": ("Testes de restauracao recorrentes e validacao de backup",
+            "Servico recorrente de testes de restore e VALIDATE com evidencia para auditoria (Anexo I)"),
+ "GOVERNANCA": ("Governanca de continuidade: BIA, RPO/RTO e Plano de DR",
+                "Projeto de continuidade de negocios: BIA, definicao de RPO/RTO com a area de negocio e plano de DR testado"),
+ "CRIPTOGRAFIA": ("Protecao dos dados em backup (LGPD)",
+                  "Criptografia de backup (RMAN/TDE com licenciamento adequado, OCI ou criptografia no repositorio) e gestao de chaves"),
+ "MONITORAMENTO": ("Monitoramento de backup com alerta ativo",
+                   "Suporte e monitoramento de missao critica, com alerta de falha e atraso de backup"),
+ "CREDENCIAIS": ("Gestao de credenciais das rotinas de backup",
+                 "Remocao de senhas em scripts (wallet / Secure External Password Store), cofre de senhas e rotacao"),
+ "SUSTENTACAO_DB": ("Consultoria e sustentacao de banco de dados",
+                    "Ajustes de RMAN, ARCHIVELOG, retencao, autobackup e backup logico por DBA especialista"),
+}
+ACHADOS = []
+CHAVES = set()
+def novo_achado(sev, cat, pilar, chave, tit, evid, imp, rec, opp, host, origem):
+    sev = sev.strip().upper()
+    if sev not in SEV_ORD: sev = "INFO"
+    ACHADOS.append({"severidade": sev, "categoria": cat.strip(), "pilar_32110": pilar.strip() or "-",
+                    "chave": chave.strip(), "titulo": tit.strip(), "evidencia": evid.strip(), "impacto": imp.strip(),
+                    "recomendacao": rec.strip(), "oportunidade": opp.strip() if opp.strip() in OPP else "SUSTENTACAO_DB",
+                    "host": host.strip(), "origem": origem})
+    CHAVES.add(chave.strip())
+# (1) modulo 13
+ARQ13 = sorted(set(glob.glob(os.path.join(raiz, "**", "13_seguranca", "achados.tsv"), recursive=True)))
+HOSTS13 = set()
+for f13 in ARQ13:
+    try:
+        lin13 = open(f13, encoding="utf-8-sig", errors="replace").read().splitlines()
+    except Exception:
+        continue
+    for ln in lin13[1:]:
+        c = ln.split("\t")
+        if len(c) < 11 or not c[1].strip():
+            continue
+        HOSTS13.add(c[10].strip())
+        novo_achado(c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], "modulo 13")
+CHAVES13 = set(CHAVES)
+# (2) alertas com mapeamento conhecido (agrupados por chave)
+REGRAS = [
+ (r'Credencial embutida em script', "CRED_SCRIPT", "ALTO", "CREDENCIAIS", "-", "CREDENCIAIS",
+  "Senha ou token em texto claro em script de backup", "Quem ler o script obtem acesso ao banco ou a nuvem (inclusive a copia off-site)",
+  "Mover credenciais para wallet/cofre, restringir permissao do script e rotacionar as credenciais expostas"),
+ (r'keystore TDE com FULLY_BACKED_UP=NO', "TDE_CHAVE_SEM_BKP", "CRITICO", "RECUPERABILIDADE", "-", "SUSTENTACAO_DB",
+  "Chaves TDE sem backup", "Backup de banco criptografado e irrecuperavel sem a chave", "Fazer backup do keystore TDE e guardar fora do servidor"),
+ (r'nenhum backup NIVEL 0 identificado', "ORA_SEM_FULL", "ALTO", "INTEGRIDADE", "3", "SUSTENTACAO_DB",
+  "Nenhum backup full/nivel 0 em 35 dias", "Sem ponto de partida valido para restauracao", "Executar full e corrigir o agendamento"),
+ (r'sem criptografia RMAN|criptografia de backup desabilitada', "ORA_SEM_CRIPTO", "MEDIO", "CRIPTOGRAFIA", "-", "CRIPTOGRAFIA",
+  "Backup de banco sem criptografia", "Dados legiveis por quem acessar o repositorio ou a copia (LGPD)", "Criptografar o backup ou o repositorio"),
+ (r'nenhuma execucao de VALIDATE', "ORA_SEM_VALIDATE", "ALTO", "INTEGRIDADE", "0", "TESTES",
+  "Backups nao validados (sem VALIDATE/RESTORE VALIDATE)", "Falha no backup so aparece na hora da restauracao", "Agendar VALIDATE periodico e testes de restauracao"),
+ (r'RETENTION POLICY TO NONE|RMAN-06525', "ORA_RET_NONE", "ALTO", "RETENCAO", "3", "REPOSITORIO",
+  "Sem politica de retencao no RMAN", "Historico depende de exclusao manual", "Definir RECOVERY WINDOW no RMAN"),
+ (r'RETENTION POLICY REDUNDANCY 1', "ORA_RET_RED1", "ALTO", "RETENCAO", "3", "REPOSITORIO",
+  "Retencao RMAN de uma unica copia (REDUNDANCY 1)", "Perda ou corrupcao desse backup deixa o banco sem recuperacao", "Adotar RECOVERY WINDOW e copias adicionais"),
+ (r'^Backup logico: nenhum dump', "LOGICO_AUSENTE", "MEDIO", "RECUPERABILIDADE", "LOGICO", "SUSTENTACAO_DB",
+  "Sem backup logico recente", "Restauracao granular exige restaurar o banco inteiro", "Data Pump periodico dos schemas criticos"),
+ (r'archive de WAL FALHANDO', "PG_WAL_FALHA", "ALTO", "INTEGRIDADE", "0", "MONITORAMENTO",
+  "PostgreSQL com archive de WAL falhando", "Sem PITR a partir da falha", "Corrigir o archive_command e monitorar"),
+ (r'sem retention rule|retention rule nao evidenciada', "BUCKET_SEM_RETENCAO", "ALTO", "RANSOMWARE", "1-IMUT", "IMUTAVEL",
+  "Bucket de backup sem retention rule (sem imutabilidade)", "Objetos de backup podem ser apagados por credencial comprometida", "Retention rule travada no bucket de backup"),
+ (r'backup gerenciado FALHOU', "OCI_DBS_FALHA", "ALTO", "INTEGRIDADE", "0", "MONITORAMENTO",
+  "Backup gerenciado de DB System com falha", "Periodo sem backup valido na OCI", "Tratar a causa e monitorar"),
+ (r'Nenhuma copia cross-region', "OFFSITE_SEM_REGIAO", "MEDIO", "3-2-1-1-0", "1-OFF", "OFFSITE",
+  "Sem copia em outra regiao", "Desastre regional afeta dados e backups", "Copia cross-region automatizada"),
+ (r'Veeam: nenhum repositorio com imutabilidade|sem Vault Lock|Vault sem imutabilidade|nenhum vault com Vault Lock', "REPO_SEM_IMUTABILIDADE", "ALTO", "RANSOMWARE", "1-IMUT", "IMUTAVEL",
+  "Repositorio de backup sem imutabilidade", "Ransomware ou credencial comprometida apaga os backups", "Repositorio imutavel / retencao bloqueada"),
+ (r'Veeam: backup da configuracao SEM criptografia', "VEEAM_CFG_SEM_CRIPTO", "MEDIO", "CRIPTOGRAFIA", "-", "CRIPTOGRAFIA",
+  "Backup da configuracao do Veeam sem criptografia", "Recuperacao do servidor Veeam perde as credenciais salvas", "Habilitar criptografia no backup de configuracao"),
+ (r'^Monitoramento: nenhum envio de notificacao', "MON_SEM_ALERTA", "MEDIO", "GOVERNANCA", "0", "MONITORAMENTO",
+  "Falha de backup sem alerta ativo", "Falhas passam despercebidas ate a necessidade de restauracao", "Alerta de falha/atraso de backup no monitoramento"),
+]
+agr = {}
+for a in ALERTAS:
+    for (rx, ch, sev, cat, pil, opp, tit, imp, rec) in REGRAS:
+        if re.search(rx, a, re.I):
+            if ch in CHAVES13:
+                break
+            agr.setdefault(ch, [sev, cat, pil, opp, tit, imp, rec, []])[7].append(a)
+            break
+for ch, (sev, cat, pil, opp, tit, imp, rec, evs) in sorted(agr.items()):
+    novo_achado(sev, cat, pil, ch, tit, " | ".join(e[:160] for e in evs[:3]) + (" (+%d)" % (len(evs) - 3) if len(evs) > 3 else ""),
+                imp, rec, opp, "", "alertas do digest")
+# (3) criterios 3-2-1-1-0 sem achado especifico do mesmo pilar
+PIL = {"COPIAS": ("3", "ALTO", "Regra 3-2-1-1-0: menos de 3 copias dos dados (producao + 2 backups)",
+                  "Uma unica falha (backup corrompido, apagado ou perdido) elimina a recuperacao", "Manter ao menos 2 copias de backup em locais distintos", "REPOSITORIO"),
+       "MIDIAS": ("2", "MEDIO", "Regra 3-2-1-1-0: backups em um unico tipo de midia/tecnologia",
+                  "Falha ou ataque a essa tecnologia derruba todas as copias", "Adicionar segunda midia (object storage ou appliance distinto)", "REPOSITORIO"),
+       "OFFSITE": ("1-OFF", "ALTO", "Regra 3-2-1-1-0: sem copia off-site (outro site, regiao ou nuvem)",
+                   "Incidente no datacenter (incendio, inundacao, ataque) perde dados e backups", "Copia automatizada para outro site, regiao ou nuvem", "OFFSITE"),
+       "IMUTAVEL": ("1-IMUT", "CRITICO", "Regra 3-2-1-1-0: sem copia imutavel, offline ou air-gapped",
+                    "Ransomware ou credencial comprometida apaga/criptografa todos os backups", "Copia com retencao bloqueada (WORM, Object Lock, time-lock) ou offline", "IMUTAVEL"),
+       "TESTES": ("0", "ALTO", "Regra 3-2-1-1-0: sem teste de restauracao com sucesso comprovado",
+                  "Falha no backup so e descoberta durante o incidente", "Testes de restauracao periodicos documentados (Anexo I) e VALIDATE", "TESTES"),
+       "LOGICO": ("LOGICO", "MEDIO", "Sem backup logico complementar",
+                  "Restauracao granular (tabela/schema) exige restaurar o banco inteiro", "Data Pump periodico dos schemas criticos", "SUSTENTACAO_DB")}
+pil_cobertos = set(x["pilar_32110"] for x in ACHADOS)
+for k in ("IMUTAVEL", "OFFSITE", "COPIAS", "TESTES", "MIDIAS", "LOGICO"):
+    sit = SITUACAO.get(k, "NAO EVIDENCIADO")
+    pil, sev, tit, imp, rec, opp = PIL[k]
+    if pil in pil_cobertos or sit not in ("NAO ATENDE", "NAO EVIDENCIADO"):
+        continue
+    contra = "; ".join(IND[k]["c"][:3]) or "nenhum indicio a favor nas evidencias coletadas"
+    if sit == "NAO EVIDENCIADO":
+        sev = SEV_BAIXA[sev]; tit = tit + " (nao evidenciado: confirmar)"
+    novo_achado(sev, "3-2-1-1-0", pil, "P_" + k, tit, contra, imp, rec, opp, "", "indicadores 3-2-1-1-0")
+# (4) governanca: RPO/RTO nunca vem da coleta
+novo_achado("MEDIO", "GOVERNANCA", "-", "GOV_RPO_RTO", "RPO e RTO nao definidos pela area de negocio",
+            "Coleta registra RPO/RTO acordados como A DEFINIR; observados em EVIDENCIAS DE RESTAURACAO",
+            "Sem meta acordada nao ha como afirmar se o backup atende o negocio nem priorizar investimentos",
+            "Definir RPO/RTO por servico com a area de negocio (BIA) e registrar na politica", "GOVERNANCA", "", "regra fixa")
+ACHADOS.sort(key=lambda x: (SEV_ORD[x["severidade"]], x["categoria"], x["titulo"]))
+for i, x in enumerate(ACHADOS, 1):
+    x["id"] = "VUL-%03d" % i
+CONT = dict((s, sum(1 for x in ACHADOS if x["severidade"] == s)) for s in SEV_ORD)
+sec("VULNERABILIDADES E INCONFORMIDADES (secao 9 da politica; manter os IDs VUL-xxx)")
+add("  Total %d | CRITICO %d | ALTO %d | MEDIO %d | BAIXO %d | INFO %d" % (len(ACHADOS), CONT["CRITICO"], CONT["ALTO"], CONT["MEDIO"], CONT["BAIXO"], CONT["INFO"]))
+add("  Fontes: modulo 13 (hosts: %s), alertas automaticos, indicadores 3-2-1-1-0, regra fixa de RPO/RTO." % (", ".join(sorted(HOSTS13)) or "nao executado"))
+add("  Na politica: tom construtivo (plano de adequacao), sem citar produto/fornecedor; evidencia e acao por item.")
+if not ARQ13:
+    add("  ! Modulo 13 nao executado neste pacote: matriz PARCIAL (sem varredura de exposicao, exports e hardening).")
+for x in ACHADOS:
+    lin = "  [%s] %s %s | pilar %s%s | %s" % (x["severidade"], x["id"], x["categoria"], x["pilar_32110"],
+                                             (" | " + x["host"]) if x["host"] else "", x["titulo"])
+    if x["severidade"] in ("CRITICO", "ALTO"):
+        add(lin[:180]); add("      evidencia: " + x["evidencia"][:150]); add("      acao: " + x["recomendacao"][:150])
+    elif x["severidade"] == "MEDIO":
+        add(lin[:180])
+bi = [x for x in ACHADOS if x["severidade"] in ("BAIXO", "INFO")]
+if bi:
+    add("  BAIXO/INFO (%d): %s" % (len(bi), "; ".join(x["id"] + " " + x["titulo"][:60] for x in bi[:8])))
+# Insumo comercial (interno): agrupa achados por oportunidade de adequacao
+OPS = []
+for cod, (nome, sol) in OPP.items():
+    rel = [x for x in ACHADOS if x["oportunidade"] == cod]
+    if not rel:
+        continue
+    pior = min(SEV_ORD[x["severidade"]] for x in rel)
+    prio = {0: "P1 imediata", 1: "P2 curto prazo", 2: "P3 medio prazo"}.get(pior, "P4 oportunidade")
+    OPS.append({"codigo": cod, "oportunidade": nome, "solucao_referencia": sol, "prioridade": prio,
+                "achados": [x["id"] for x in rel], "pior_severidade": [k for k, v in SEV_ORD.items() if v == pior][0]})
+OPS.sort(key=lambda o: (o["prioridade"], -len(o["achados"])))
+sec("INSUMO COMERCIAL - INTERNO WiseDB (NAO vai para o documento do cliente)")
+add("  Oportunidades de adequacao sustentadas pelos achados acima (detalhe em OPORTUNIDADES_COMERCIAIS_INTERNO.txt):")
+for o in OPS:
+    add("  [%s] %s -> %s" % (o["prioridade"], o["oportunidade"][:70], ", ".join(o["achados"][:8])))
+dir_saida = os.path.dirname(os.path.abspath(saida))
+try:
+    with open(os.path.join(dir_saida, "MATRIZ_VULNERABILIDADES.tsv"), "w", encoding="utf-8") as fm:
+        fm.write("ID\tSEVERIDADE\tCATEGORIA\tPILAR_32110\tHOST\tTITULO\tEVIDENCIA\tIMPACTO\tRECOMENDACAO\tOPORTUNIDADE\tCHAVE\tORIGEM\n")
+        for x in ACHADOS:
+            fm.write("\t".join([x["id"], x["severidade"], x["categoria"], x["pilar_32110"], x["host"], x["titulo"], x["evidencia"],
+                                x["impacto"], x["recomendacao"], x["oportunidade"], x["chave"], x["origem"]]) + "\n")
+    with open(os.path.join(dir_saida, "OPORTUNIDADES_COMERCIAIS_INTERNO.txt"), "w", encoding="utf-8") as fo:
+        fo.write("USO INTERNO WiseDB - NAO ENVIAR AO CLIENTE\n")
+        fo.write("Cliente: %s | Gerado em %s | Achados: %d (CRITICO %d, ALTO %d)\n\n" % (
+            cliente, datetime.datetime.now().strftime("%d/%m/%Y %H:%M"), len(ACHADOS), CONT["CRITICO"], CONT["ALTO"]))
+        for o in OPS:
+            fo.write("=" * 78 + "\n[%s] %s\nSolucao de referencia: %s\n\nJustificativa (achados com evidencia):\n" % (
+                o["prioridade"], o["oportunidade"], o["solucao_referencia"]))
+            for x in ACHADOS:
+                if x["id"] in o["achados"]:
+                    fo.write("  %s [%s] %s%s\n      Evidencia: %s\n      Impacto: %s\n" % (
+                        x["id"], x["severidade"], x["titulo"], (" (" + x["host"] + ")") if x["host"] else "", x["evidencia"][:300], x["impacto"]))
+            fo.write("\n")
+except Exception as e:
+    print("[AVISO] Matriz/oportunidades nao gravadas: " + str(e))
+
 # ============================ 6. ALERTAS ====================================
 sec("ALERTAS AUTOMATICOS (para a IA classificar como gap/risco)")
 if ALERTAS:
@@ -1627,7 +1826,8 @@ try:
     estr = {"cliente": cliente, "papel": papel, "gerado_em": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             "indicadores_321110": dict((k, {"situacao": SITUACAO.get(k, "NAO EVIDENCIADO"), "a_favor": IND[k]["a"],
                                             "contra": IND[k]["c"]}) for k in IND),
-            "locais_com_copia": sorted(LOCAIS), "alertas": alertas_unicos}
+            "locais_com_copia": sorted(LOCAIS), "alertas": alertas_unicos,
+            "vulnerabilidades": {"resumo": CONT, "achados": ACHADOS}, "oportunidades_internas": OPS}
     js = re.sub(r'\.txt$', '', saida) + ".json"
     with open(js, "w", encoding="utf-8") as f:
         json.dump(estr, f, ensure_ascii=False, indent=2)

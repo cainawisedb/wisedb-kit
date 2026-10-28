@@ -1,11 +1,15 @@
 #!/bin/bash
 #===============================================================================
 # wisedb_coleta_auto.sh - WiseDB | Coleta AUTOMATICA para Politica de Backup
-# v3.6 - Wizard blindado + multicloud + evidencias de restauracao com descoberta automatica
+# v4.0 - Wizard blindado + multicloud + restauracao + modo local + seguranca/conformidade
 #
-# USO:
-#   export WISEDB_BASE_URL="https://raw.githubusercontent.com/SUAORG/wisedb-kit/main"
-#   bash <(curl -fsSL "$WISEDB_BASE_URL/wisedb_coleta_auto.sh")
+# USO (com acesso ao GitHub):
+#   bash <(curl -fsSL https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main/wisedb_coleta_auto.sh)
+#
+# USO (sem internet / VPN / PAM): copie a pasta inteira do kit para o servidor
+#   cd /caminho/kit_coleta_backup && bash wisedb_coleta_auto.sh
+#   Rodando de um arquivo numa pasta com os modulos, NADA e buscado na rede.
+#   WISEDB_OFFLINE=1 forca o modo local; WISEDB_KIT_DIR=/pasta aponta o kit.
 #
 #   Em host legado, a v3.3 tenta TLS normal nos modulos e faz fallback
 #   automatico para -k somente quando o curl retornar erro 60. Para desabilitar:
@@ -19,6 +23,31 @@
 #   tenancy escolhida entra como evidencia do cliente.
 #
 # RISCO: Zero no ambiente. Somente leitura.
+#
+# v4.0 (outubro/2026) - vulnerabilidades e inconformidades na politica
+#   [NOVO]      Modulo 13 (seguranca e conformidade) roda em toda coleta completa
+#               com coleta local: repositorio exposto ao servidor de producao,
+#               exports NFS, imutabilidade/snapshot/dedup no servidor de backup,
+#               retencao, full apagado antes do novo full, janela, VALIDATE,
+#               NOARCHIVELOG, criptografia, permissoes, SO/banco fora de suporte
+#               e hardening. Rode tambem no servidor de backup.
+#   [NOVO]      Digest 2.6: matriz de vulnerabilidades (VUL-xxx) no RESUMO,
+#               MATRIZ_VULNERABILIDADES.tsv e OPORTUNIDADES_COMERCIAIS_INTERNO.txt
+#               (insumo comercial interno, nao vai para o cliente).
+#
+# v3.9 (outubro/2026) - modo local real e fim dos travamentos de rede
+#   [CRITICO]   Sem acesso ao GitHub o script parava logo apos a linha "Host:":
+#               o teste de download dos modulos nao tinha timeout e, em rede que
+#               descarta pacotes (firewall/VPN), o curl esperava indefinidamente.
+#   [NOVO]      Origem dos modulos: LOCAL quando o orquestrador roda de um arquivo
+#               numa pasta com os modulos (zero acesso a rede); GITHUB quando vem
+#               por link, com fallback automatico para a copia local se houver.
+#               Sem GitHub e sem copia local, aborta em segundos com instrucao.
+#   [CORRIGIDO] BASE_URL padrao apontava para SUAORG (placeholder): pelo bootstrap
+#               os modulos davam 404. Padrao agora e cainawisedb/wisedb-kit.
+#   [NOVO]      Todo acesso a rede tem teto de tempo (curl, OCI/AWS/Azure/GCP CLI),
+#               e df/find da descoberta tem timeout (montagem NFS morta travava).
+#   [NOVO]      Origem dos modulos registrada no nivel_privilegio e no resultado.json.
 #
 # v3.8 (outubro/2026) - cobertura PostgreSQL/MySQL e correcoes validadas
 #   [NOVO]      Modulos 11 (PostgreSQL) e 12 (MySQL/MariaDB): o wizard detecta,
@@ -137,8 +166,8 @@ SSL_FALLBACK_USADO=0
 COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
-BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.8"
+BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main}"
+VERSAO="4.0"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -168,6 +197,17 @@ info(){ say "  ${CINZA}$*${R}"; }
 ok(){ say "  ${VERD}OK${R}  $*"; }
 warn(){ say "  ${AMAR}!${R}   $*"; ALERTAS+=("$*"); }
 erro(){ say "  ${VERM}X${R}   $*"; }
+# aviso: mensagem operacional so de tela. Nao entra em ALERTAS (que vao para o
+# RESUMO da politica), porque origem dos modulos nao e risco do cliente.
+aviso(){ say "  ${AMAR}!${R}   $*"; }
+# comtempo SEG comando...: teto de tempo para qualquer comando que possa travar
+# (rede, CLI de nuvem, df/find em montagem NFS morta). Sem coreutils timeout,
+# executa direto.
+if command -v timeout >/dev/null 2>&1; then
+  comtempo(){ local s="$1"; shift; timeout -k 5 "$s" "$@"; }
+else
+  comtempo(){ shift; "$@"; }
+fi
 
 #-------------------------------------------------------------------------------
 # AWS nao tem equivalente ao compartment-id-in-subtree da OCI: recurso so
@@ -223,10 +263,15 @@ wisedb_curl(){
   local url="$1"; shift
   local err rc
   err=$(mktemp "${TMPDIR:-/tmp}/wisedb_curl.XXXXXX") || err=""
+  # Teto de tempo obrigatorio: sem ele, rede que descarta pacotes deixava o
+  # curl parado por tempo indeterminado (causa do travamento ate a v3.8).
+  # Opcoes passadas pelo chamador (ex.: -m menor) vem depois e prevalecem.
+  local cto="${WISEDB_CONNECT_TIMEOUT:-8}" mto="${WISEDB_DL_TIMEOUT:-120}"
+  command -v curl >/dev/null 2>&1 || { [ -n "$err" ] && rm -f "$err"; return 127; }
   if [ -n "$err" ]; then
-    curl -fsSL "$url" "$@" 2>"$err"; rc=$?
+    comtempo $((mto+10)) curl -fsSL --connect-timeout "$cto" -m "$mto" "$url" "$@" 2>"$err"; rc=$?
   else
-    curl -fsSL "$url" "$@" 2>/dev/null; rc=$?
+    comtempo $((mto+10)) curl -fsSL --connect-timeout "$cto" -m "$mto" "$url" "$@" 2>/dev/null; rc=$?
   fi
 
   if [ "$rc" -eq 0 ]; then
@@ -238,7 +283,7 @@ wisedb_curl(){
   if [ "$rc" -eq 60 ] && [ "$WISEDB_SSL_FALLBACK" = "1" ]; then
     SSL_FALLBACK_USADO=1
     warn "TLS/CA nao confiavel para $url; tentando novamente com -k (fallback SSL habilitado)"
-    if curl -k -fsSL "$url" "$@"; then
+    if comtempo $((mto+10)) curl -k -fsSL --connect-timeout "$cto" -m "$mto" "$url" "$@"; then
       [ -n "$err" ] && rm -f "$err" 2>/dev/null
       return 0
     fi
@@ -317,11 +362,58 @@ menu_sel(){ # menu_sel single|multi "titulo" item...
   done
 }
 
+#-------------------------------------------------------------------------------
+# ORIGEM DOS MODULOS (v3.9)
+#   LOCAL  : o orquestrador roda de um arquivo numa pasta que tem os modulos (ou
+#            WISEDB_OFFLINE=1 / WISEDB_KIT_DIR). Tudo sai da pasta; zero rede.
+#   GITHUB : o orquestrador veio por link (bash <(curl ...) ou bootstrap). Os
+#            modulos vem de BASE_URL na mesma versao do orquestrador; se o
+#            GitHub nao responder, usa a copia local (pasta atual ou
+#            ./kit_coleta_backup) quando existir.
+#-------------------------------------------------------------------------------
+kit_ok(){ [ -n "${1:-}" ] && [ -f "$1/01_coleta_linux_geral.sh" ]; }
+SELF="${BASH_SOURCE[0]:-$0}"; SELF_DIR=""
+[ -f "$SELF" ] && SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+KIT_DIR=""
+for c in "${WISEDB_KIT_DIR:-}" "$SELF_DIR" "$ORIG_DIR" "$ORIG_DIR/kit_coleta_backup"; do
+  kit_ok "$c" && { KIT_DIR="$(cd "$c" && pwd)"; break; }
+done
+case "${WISEDB_ORIGEM:-}" in
+  LOCAL|GITHUB) ORIGEM="$WISEDB_ORIGEM";;
+  *) if [ "${WISEDB_OFFLINE:-0}" = "1" ] || kit_ok "${WISEDB_KIT_DIR:-}" || kit_ok "$SELF_DIR"; then
+       ORIGEM="LOCAL"; else ORIGEM="GITHUB"; fi;;
+esac
+NET_OK=0
+
 say ""
 say "${MARBG}${LAR}${NEG}  WiseDB - Coleta Automatica de Backup  v$VERSAO  ${R}"
 info "Host: $FQDN | Usuario: $(whoami) | $(date '+%d/%m/%Y %H:%M %Z')"
-wisedb_curl "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null || \
-  warn "Nao foi possivel baixar modulos de $BASE_URL (verifique WISEDB_BASE_URL, HTTPS e/ou WISEDB_SSL_FALLBACK)"
+if [ "$ORIGEM" = "LOCAL" ]; then
+  if [ -z "$KIT_DIR" ]; then
+    erro "Modo local pedido, mas nenhuma pasta com os modulos foi encontrada."
+    info "Rode de dentro da pasta do kit (cd <pasta_do_kit> && bash wisedb_coleta_auto.sh)"
+    info "ou informe a pasta: WISEDB_KIT_DIR=/caminho/do/kit bash wisedb_coleta_auto.sh"
+    exit 1
+  fi
+  ok "Modulos: pasta local ${NEG}$KIT_DIR${R} (nenhum acesso a rede para buscar modulos)"
+else
+  info "Testando acesso a $BASE_URL (no maximo ${WISEDB_NET_TIMEOUT:-20}s)..."
+  if wisedb_curl "$BASE_URL/01_coleta_linux_geral.sh" -o /dev/null -m "${WISEDB_NET_TIMEOUT:-20}" 2>/dev/null; then
+    NET_OK=1
+    ok "Modulos: GitHub ${DIM}($BASE_URL)${R}"
+    [ -n "$KIT_DIR" ] && info "Copia local em $KIT_DIR fica como reserva se algum download falhar"
+  elif [ -n "$KIT_DIR" ]; then
+    ORIGEM="LOCAL"
+    aviso "GitHub nao respondeu deste host: usando os modulos da pasta local ${NEG}$KIT_DIR${R}"
+  else
+    erro "GitHub nao respondeu deste host e nao ha copia local do kit."
+    info "Leve a pasta completa do kit para o servidor e rode de dentro dela:"
+    info "  cd <pasta_do_kit> && bash wisedb_coleta_auto.sh"
+    exit 1
+  fi
+fi
+export WISEDB_ORIGEM_MODULOS="$ORIGEM${KIT_DIR:+ ($KIT_DIR)}"
+[ "$ORIGEM" = "GITHUB" ] && WISEDB_ORIGEM_MODULOS="GITHUB ($BASE_URL)"
 
 #===============================================================================
 # FASE 0 - MODO DA COLETA
@@ -562,17 +654,17 @@ fi
     grep -Eo '/[A-Za-z0-9._/-]{4,}' | grep -Ei 'backup|bkp|dump|export' | xargs -r -n1 dirname 2>/dev/null
   mount | awk '{print $3}' | grep -Ei 'backup|bkp|stage|^/u0'
   ls -d /u0*/ /backup* /bkp* /stage* /var/backup* 2>/dev/null
-} 2>/dev/null | sed 's:/*$::' | sort -u | while read -r d; do [ -d "$d" ] && echo "$d"; done > "$TMP/_dirs"
+} 2>/dev/null | sed 's:/*$::' | sort -u | while read -r d; do comtempo 5 test -d "$d" && echo "$d"; done > "$TMP/_dirs"
 mapfile -t DIR_CAND < "$TMP/_dirs"
 if [ ${#DIR_CAND[@]} -gt 0 ]; then
   ok "Diretorios candidatos a repositorio: ${#DIR_CAND[@]}"
-  for d in "${DIR_CAND[@]}"; do info "  - $d ${DIM}$(df -h "$d" 2>/dev/null | awk 'NR==2{print "("$2" total, "$5" usado)"}')${R}"; done
+  for d in "${DIR_CAND[@]}"; do info "  - $d ${DIM}$(comtempo 10 df -h "$d" 2>/dev/null | awk 'NR==2{print "("$2" total, "$5" usado)"}')${R}"; done
 fi
 fi # fim do bloco exclusivo do modo COMPLETA
 
 # Previa das evidencias de clonagem (a varredura completa e feita pelo modulo 09)
-RST_PREVIA=$(for d in $(find / -maxdepth 1 -type d -iname '*wisedb*' 2>/dev/null) /home/oracle; do
-               [ -d "$d" ] && find "$d" -maxdepth 4 -type f \( -iname '*clon*' -o -iname '*duplic*' -o -iname '*refresh*' \) \
+RST_PREVIA=$(for d in $(comtempo 30 find / -maxdepth 1 -type d -iname '*wisedb*' 2>/dev/null) /home/oracle; do
+               [ -d "$d" ] && comtempo 60 find "$d" -maxdepth 4 -type f \( -iname '*clon*' -o -iname '*duplic*' -o -iname '*refresh*' \) \
                  -mtime -"${WISEDB_CLONE_DAYS:-365}" 2>/dev/null
              done | sort -u | wc -l)
 if [ "${RST_PREVIA:-0}" -gt 0 ]; then
@@ -785,7 +877,8 @@ if [ ${#OCI_PROF[@]} -gt 0 ]; then
       fi
     fi
     if [ -n "$OCI_SEL_PROF" ]; then
-      if oci --profile "$OCI_SEL_PROF" os ns get >/dev/null 2>&1 || oci --profile "$OCI_SEL_PROF" iam region list >/dev/null 2>&1; then
+      info "Validando autenticacao do profile (no maximo ~2 min)..."
+      if comtempo 60 oci --profile "$OCI_SEL_PROF" os ns get >/dev/null 2>&1 || comtempo 60 oci --profile "$OCI_SEL_PROF" iam region list >/dev/null 2>&1; then
         ok "Autenticacao do profile validada"
       else
         warn "Profile '$OCI_SEL_PROF' nao autenticou (chave/permissao): a coleta OCI pode vir vazia"
@@ -836,7 +929,7 @@ if [ "$CLOUD_ALVOS" -gt 0 ]; then
       fi
       case "$prov" in
         AWS)
-          if ident=$(aws sts get-caller-identity --profile "$id" --output text \
+          if ident=$(comtempo 40 aws sts get-caller-identity --profile "$id" --cli-connect-timeout 10 --output text \
                      --query 'join(`" | "`, [Account, Arn])' 2>/dev/null); then
             ok "AWS '$id' autenticado: $ident"
             case "$ident" in *:user/*|*root*) warn "Credencial AWS do profile '$id' parece administrativa/estatica: registrar como risco na politica";; esac
@@ -848,7 +941,7 @@ if [ "$CLOUD_ALVOS" -gt 0 ]; then
             warn "Profile AWS '$id' nao autenticou: alvo descartado"; continue
           fi;;
         GCP)
-          if gcloud --configuration="$id" auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | grep -q .; then
+          if comtempo 40 gcloud --configuration="$id" auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | grep -q .; then
             proj=$(gcloud --configuration="$id" config get-value project 2>/dev/null | grep -v '^(unset)$' || true)
             [ -z "$proj" ] && { warn "Configuration GCP '$id' sem projeto definido"; pergunta "  ID do projeto GCP para '$id'" proj ""; }
             [ -z "$proj" ] && { warn "Sem projeto: alvo GCP '$id' descartado"; continue; }
@@ -857,7 +950,7 @@ if [ "$CLOUD_ALVOS" -gt 0 ]; then
             warn "Configuration GCP '$id' sem conta ativa (rode gcloud auth activate-service-account): alvo descartado"; continue
           fi;;
         AZURE)
-          if az account show --subscription "$id" >/dev/null 2>&1; then
+          if comtempo 40 az account show --subscription "$id" >/dev/null 2>&1; then
             ok "Azure '${extra:-$id}' autenticado"
           else
             warn "Subscription Azure '$id' nao respondeu: alvo descartado"; continue
@@ -952,6 +1045,7 @@ else
   say "  Nuvem publica .....: nenhuma alem da OCI"
 fi
 say "  Evid. restauracao .: $([ "$RST_ON" = "1" ] && echo "SIM${RST_DIRS:+ (extras: $RST_DIRS)}" || echo "NAO")"
+[ "$MODO" = "COMPLETA" ] && say "  Seguranca/conform. : $([ "$COLETA_LOCAL" = "1" ] && echo "SIM (modulo 13: exposicao, imutabilidade, retencao, hardening)" || echo "NAO (host de ferramenta)")"
 say "  RPO / RTO .........: A DEFINIR (valores observados medidos no ambiente)"
 [ "$MODO" = "COMPLETA" ] && say "  Fora do escopo ....: ${#EXCL[@]} item(ns)"
 if [ ${#ALERTAS[@]} -gt 0 ]; then
@@ -967,14 +1061,21 @@ titulo "FASE 6 - COLETA (somente leitura)"
 dl(){ local m="$1"; local dest="${TMP_DIGEST:-$TMP}"
   [ "$m" = "wisedb_digest.py" ] || dest="$TMP"
   mkdir -p "$dest"
-  if   [ -f "$ORIG_DIR/kit_coleta_backup/$m" ]; then cp "$ORIG_DIR/kit_coleta_backup/$m" "$dest/$m"
-  elif [ -f "$ORIG_DIR/$m" ]; then cp "$ORIG_DIR/$m" "$dest/$m"
-  else wisedb_download "$m" "$dest/$m" || { erro "Falha ao baixar $m"; MODULOS_FALHARAM+=("$m"); COLETA_INCOMPLETA=1; return 1; }
-       [ -s "$dest/$m" ] || { erro "$m veio vazio"; return 1; }
+  if [ "$ORIGEM" = "LOCAL" ]; then
+    if [ -f "$KIT_DIR/$m" ]; then cp "$KIT_DIR/$m" "$dest/$m"
+    else erro "Modulo $m nao esta na pasta do kit ($KIT_DIR)"; MODULOS_FALHARAM+=("$m(ausente)"); COLETA_INCOMPLETA=1; return 1; fi
+  elif [ "$NET_OK" = "1" ] && wisedb_download "$m" "$dest/$m" 2>/dev/null && [ -s "$dest/$m" ]; then
+    :
+  elif [ -n "$KIT_DIR" ] && [ -f "$KIT_DIR/$m" ]; then
+    aviso "Download de $m falhou: usando a copia local de $KIT_DIR"
+    cp "$KIT_DIR/$m" "$dest/$m"
+  else
+    erro "Falha ao obter $m (GitHub e copia local indisponiveis)"; MODULOS_FALHARAM+=("$m"); COLETA_INCOMPLETA=1; return 1
   fi
+  [ -s "$dest/$m" ] || { erro "$m veio vazio"; MODULOS_FALHARAM+=("$m(vazio)"); COLETA_INCOMPLETA=1; return 1; }
   chmod +x "$dest/$m"; }
 
-cd "$WORK"
+cd "$WORK" || { erro "Nao foi possivel entrar em $WORK"; exit 1; }
 if [ "$MODO" = "COMPLETA" ]; then
 if [ "$COLETA_LOCAL" = "1" ]; then
   if dl 01_coleta_linux_geral.sh; then
@@ -1070,6 +1171,18 @@ if [ "$RST_ON" = "1" ]; then
     fi
   fi
 fi
+# Seguranca e conformidade do backup (modulo 13): vulnerabilidades e inconformidades
+if [ "$MODO" = "COMPLETA" ] && [ "$COLETA_LOCAL" = "1" ]; then
+  info "Varredura de seguranca e conformidade do backup (somente leitura)..."
+  if dl 13_coleta_seguranca_conformidade.sh; then
+    if WISEDB_ORA_SIDS="${ORA_SEL[*]:-}" WISEDB_DIRS="${DIR_SEL[*]:-}" WISEDB_SUDO="$WISEDB_SUDO" \
+         bash "$TMP/13_coleta_seguranca_conformidade.sh" </dev/null; then
+      ok "Seguranca e conformidade avaliadas"
+    else
+      erro "Modulo 13 falhou durante a coleta"; MODULOS_FALHARAM+=("13_coleta_seguranca_conformidade.sh(execucao)"); COLETA_INCOMPLETA=1
+    fi
+  fi
+fi
 # Registro explicito do nivel de privilegio da coleta. Entra no resultado_final e
 # permite a quem le a politica saber se o cron de sistema foi de fato auditado.
 { echo "## NIVEL DE PRIVILEGIO DESTA COLETA"
@@ -1081,6 +1194,7 @@ fi
     echo "## [PENDENCIA] agendador do backup fisico em DB System/ODA fica como INFERIDO."
   fi
   echo "## Profundidade: listagem=$WISEDB_LIST_DEPTH niveis, dumps=$WISEDB_DUMP_DEPTH niveis"
+  echo "## Origem dos modulos: $WISEDB_ORIGEM_MODULOS"
   echo "## Fallback SSL usado: $([ "$SSL_FALLBACK_USADO" = "1" ] && echo SIM || echo NAO)"
   echo "## Coleta incompleta: $([ "$COLETA_INCOMPLETA" = "1" ] && echo SIM || echo NAO)"
   if [ ${#MODULOS_FALHARAM[@]} -gt 0 ]; then echo "## Modulos com falha: ${MODULOS_FALHARAM[*]}"; fi
@@ -1102,7 +1216,7 @@ fi
   if [ ${#ALERTAS[@]} -eq 0 ]; then echo "  (nenhum)"; else
     for a in "${ALERTAS[@]}"; do echo "  ! $a"; done; fi
 } > "$WORK/escopo_wizard.txt"
-cd "$ORIG_DIR"
+cd "$ORIG_DIR" || cd /tmp || exit 1
 export WISEDB_SSL_FALLBACK_USED="$SSL_FALLBACK_USADO"
 export WISEDB_COLETA_INCOMPLETA="$COLETA_INCOMPLETA"
 
@@ -1211,7 +1325,8 @@ doc = {
  "coleta": {"host": os.uname().nodename, "papel_host": papel, "modo": modo,
             "coleta_local_habilitada": local == "1",
             "data": datetime.datetime.now().isoformat(timespec="minutes"),
-            "script_versao": os.environ.get("WISEDB_VERSAO", "?")},
+            "script_versao": os.environ.get("WISEDB_VERSAO", "?"),
+            "origem_modulos": os.environ.get("WISEDB_ORIGEM_MODULOS", "?")},
  "sgbd_detectados_no_host": dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("WISEDB_SGBD", "").split(";") if "=" in x)),
  "evidencias_restore": rst,
  "oci": {"profile_usado": prof or None, "tenancy_profile": ten or None,
@@ -1259,6 +1374,10 @@ say "  Cliente ...........: ${NEG}$CLIENTE${R}"
 say "  Papel do host .....: $PAPEL"
 say "  Arquivos coletados : $(find "$WORK" -name '*.txt' | wc -l)"
 say "  Alertas ...........: ${#ALERTAS[@]}"
+VMAT="$WORK/MATRIZ_VULNERABILIDADES.tsv"
+if [ -s "$VMAT" ]; then
+  say "  Vulnerabilidades ..: $(($(wc -l < "$VMAT")-1)) (CRITICO $(grep -c $'\tCRITICO\t' "$VMAT"), ALTO $(grep -c $'\tALTO\t' "$VMAT"), MEDIO $(grep -c $'\tMEDIO\t' "$VMAT"))"
+fi
 SEG_N=$(grep -c . "$WORK/.segredos_remanescentes" 2>/dev/null); SEG_N=${SEG_N:-0}
 if [ "${SEG_N:-0}" -gt 0 ]; then
   say "  ${VERM}${NEG}POSSIVEL SEGREDO NAO MASCARADO: $SEG_N linha(s)${R}"
@@ -1291,6 +1410,8 @@ if [ "${OKF^^}" != "N" ]; then
     say "  ${LAR}${NEG}COLE ISTO NA IA${R}: $RESUMO  ${DIM}($(wc -l < "$RESUMO") linhas)${R}"
     say "  Ver com ..........: ${DIM}cat \"$RESUMO\"${R}"
     say "  Bruto completo ...: $FINAL ${DIM}(so se a IA pedir detalhe)${R}"
+    [ -s "$WORK/MATRIZ_VULNERABILIDADES.tsv" ] && say "  Vulnerabilidades .: $WORK/MATRIZ_VULNERABILIDADES.tsv"
+    [ -s "$WORK/OPORTUNIDADES_COMERCIAIS_INTERNO.txt" ] && say "  ${AMAR}Interno WiseDB ....: $WORK/OPORTUNIDADES_COMERCIAIS_INTERNO.txt (nao enviar ao cliente)${R}"
   else
     say "  Para a IA ........: $FINAL"
   fi

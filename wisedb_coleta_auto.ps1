@@ -6,6 +6,11 @@
 
    irm https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main/wisedb_coleta_auto.ps1 | iex
 
+ SEM INTERNET : copie a pasta inteira do kit para o servidor e rode de dentro dela:
+   powershell -ExecutionPolicy Bypass -File .\wisedb_coleta_auto.ps1
+   Rodando de um arquivo numa pasta com os modulos, NADA e buscado na rede.
+   $env:WISEDB_OFFLINE='1' forca o modo local; $env:WISEDB_KIT_DIR aponta o kit.
+
  FLUXO    : 1) DETECTA: SQL Server, Veeam B&R, Veeam Agent, Hyper-V, PowerCLI
             2) WIZARD de confirmacao + cliente + itens fora do escopo
             3) CRIA a pasta de trabalho com nome do cliente e hora da coleta
@@ -13,6 +18,22 @@
             5) Executa a coleta read-only, SANITIZA, mostra RESUMO e pede OK
             6) GERA resultado_final.txt (colar na IA), resultado.json e .zip
  RISCO    : Zero. Somente leitura.
+
+ v2.6 (outubro/2026) - vulnerabilidades e inconformidades (igual ao Linux v4.0)
+   [NOVO]     Modulo 13 Windows: unidade de rede de backup mapeada, shares e
+              pastas de backup com escrita ampla, SMBv1, firewall, RDP sem NLA,
+              antivirus/EDR, Windows fora de suporte e sem atualizacao. Entra na
+              matriz VUL-xxx do digest 2.6 e no insumo comercial interno.
+
+ v2.5 (outubro/2026) - modo local real, igual ao Linux v3.9
+   [NOVO]     Origem dos modulos: LOCAL quando o script roda de um arquivo numa
+              pasta com os modulos (zero rede); GITHUB quando vem por irm|iex,
+              com fallback automatico para a copia local se o download falhar.
+   [CORRIGIDO] Pasta do proprio script ($PSScriptRoot) passa a ser procurada;
+              antes so a pasta atual e .\kit_coleta_backup.
+   [CORRIGIDO] Download com -TimeoutSec e, apos a primeira falha, os demais
+              modulos vao direto para a copia local (sem esperar de novo).
+   [NOVO]     Unblock-File nos modulos copiados (arquivo vindo de ZIP baixado).
 
  v2.4 (outubro/2026)
    [CRITICO]  Mascara igual a do Linux v3.8: mysqldump -pSENHA, rman target
@@ -47,13 +68,27 @@
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
 
 $BaseUrl = if ($env:WISEDB_BASE_URL) { $env:WISEDB_BASE_URL } else { "https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main" }
-$Versao = "2.4"
+$Versao = "2.6"
 if ($PSVersionTable.PSVersion.Major -lt 3) {
   Write-Host "ERRO: PowerShell $($PSVersionTable.PSVersion) detectado. O kit exige 3.0+." -ForegroundColor Red
   Write-Host "Instale o WMF 5.1 (KB3191566) ou rode os modulos 04/06/07 manualmente." -ForegroundColor Red
   exit 1
 }
 $OrigDir = (Get-Location).Path
+# Origem dos modulos (v2.5): pasta local do kit ou GitHub com fallback local
+function Test-Kit($d) { if ($d) { Test-Path (Join-Path $d '04_coleta_sqlserver_windows.ps1') } else { $false } }
+$SelfDir = if ($PSScriptRoot) { $PSScriptRoot } else { $null }
+$KitDir = $null
+foreach ($c in @($env:WISEDB_KIT_DIR, $SelfDir, $OrigDir, (Join-Path $OrigDir 'kit_coleta_backup'))) {
+  if (Test-Kit $c) { $KitDir = (Resolve-Path $c).Path; break }
+}
+if ($env:WISEDB_OFFLINE -eq '1' -or (Test-Kit $env:WISEDB_KIT_DIR) -or (Test-Kit $SelfDir)) { $Origem = 'LOCAL' } else { $Origem = 'GITHUB' }
+if ($Origem -eq 'LOCAL' -and -not $KitDir) {
+  Write-Host "ERRO: modo local pedido, mas nenhuma pasta com os modulos foi encontrada." -ForegroundColor Red
+  Write-Host "Rode de dentro da pasta do kit: powershell -ExecutionPolicy Bypass -File .\wisedb_coleta_auto.ps1" -ForegroundColor Red
+  exit 1
+}
+$script:NetOk = $true
 $Alertas = @()
 $Hostn = $env:COMPUTERNAME
 $Data = Get-Date -Format yyyyMMdd
@@ -64,6 +99,8 @@ $ModulosFalharam = @()
 Write-Host "==============================================================="
 Write-Host " WiseDB - Coleta Automatica de Backup v$Versao | $Hostn | $(Get-Date -Format 'dd/MM/yyyy HH:mm')"
 Write-Host " PowerShell $($PSVersionTable.PSVersion) | $([Environment]::OSVersion.VersionString)"
+if ($Origem -eq 'LOCAL') { Write-Host " Modulos: pasta local $KitDir (nenhum acesso a rede para buscar modulos)" -ForegroundColor Green }
+else { Write-Host " Modulos: GitHub ($BaseUrl)$(if ($KitDir) { "; reserva local em $KitDir" })" }
 Write-Host "==============================================================="
 
 #=========================== 0. COMPATIBILIDADE =================================
@@ -211,14 +248,28 @@ Diga "Pasta de trabalho desta coleta: $Work"
 #=========================== 3. MODULOS + COLETA ================================
 function DL($m) {
   $dst = Join-Path $Tmp $m
-  $loc1 = Join-Path (Join-Path $OrigDir 'kit_coleta_backup') $m; $loc2 = Join-Path $OrigDir $m
-  if (Test-Path $loc1) { Copy-Item $loc1 $dst -Force }
-  elseif (Test-Path $loc2) { Copy-Item $loc2 $dst -Force }
-  else {
-    try { Invoke-WebRequest -Uri "$BaseUrl/$m" -OutFile $dst -UseBasicParsing -ErrorAction Stop }
-    catch { Write-Host "ERRO: falha ao baixar $m de $BaseUrl" -ForegroundColor Red; Write-Host "  $($_.Exception.Message)" -ForegroundColor Red; return $null }
+  $loc = if ($KitDir) { Join-Path $KitDir $m } else { $null }
+  $ok = $false
+  if ($Origem -eq 'LOCAL') {
+    if ($loc -and (Test-Path $loc)) { Copy-Item $loc $dst -Force; $ok = $true }
+    else { Write-Host "ERRO: modulo $m nao esta na pasta do kit ($KitDir)" -ForegroundColor Red; return $null }
+  } else {
+    if ($script:NetOk) {
+      try {
+        Invoke-WebRequest -Uri "$BaseUrl/$m" -OutFile $dst -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        $ok = (Test-Path $dst) -and ((Get-Item $dst).Length -gt 0)
+      } catch {
+        $script:NetOk = $false
+        Write-Host "AVISO: falha ao baixar $m de $BaseUrl ($($_.Exception.Message))" -ForegroundColor Yellow
+      }
+    }
+    if (-not $ok -and $loc -and (Test-Path $loc)) {
+      Write-Host "AVISO: usando a copia local de $m em $KitDir" -ForegroundColor Yellow
+      Copy-Item $loc $dst -Force; $ok = $true
+    }
   }
-  if (-not (Test-Path $dst)) { Write-Host "ERRO: modulo $m indisponivel, etapa ignorada" -ForegroundColor Red; return $null }
+  if (-not $ok -or -not (Test-Path $dst)) { Write-Host "ERRO: modulo $m indisponivel (GitHub e copia local), etapa ignorada" -ForegroundColor Red; return $null }
+  if (Get-Command Unblock-File -ErrorAction SilentlyContinue) { try { Unblock-File -Path $dst -ErrorAction Stop } catch {} }
   return $dst
 }
 function Roda($nome, $mod, $args2) {
@@ -266,7 +317,10 @@ if ($Det.oracle.on) {
   if ($mod) { Roda "modulo 10 (Oracle Windows)" $mod $null }
   else { $ModulosFalharam += "10_coleta_oracle_windows.ps1(download)" }
 }
-Pop-Location
+# Seguranca e conformidade do backup (modulo 13, v2.6)
+  $mod = DL "13_coleta_seguranca_windows.ps1"
+  if ($mod) { Roda "modulo 13 (Seguranca e conformidade)" $mod $null }
+  Pop-Location
 
 # Registro explicito do nivel de privilegio, para quem le a politica saber se
 # Task Scheduler, msdb e Veeam foram de fato auditados.
