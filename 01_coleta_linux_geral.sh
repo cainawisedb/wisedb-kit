@@ -28,6 +28,20 @@
 #   [CORRIGIDO] Arquivos de saida truncados no inicio; reexecutar no mesmo dia
 #               nao concatena mais o conteudo anterior.
 #
+# Versao 1.4 (outubro/2026)
+#   [CRITICO]   Com sudo, os scripts chamados pelo crontab de root/oracle/etc.
+#               nao eram capturados: a lista vinha so do crontab do usuario
+#               atual e de /etc. Agora entram todos os crontabs (inclusive os
+#               de /var/spool/cron), e scripts sem permissao de leitura sao
+#               lidos via sudo.
+#   [NOVO]      Scripts disparados por systemd timers e /etc/anacrontab tambem
+#               sao capturados.
+#   [NOVO]      monitoramento_backup.txt: notificacao nos scripts (mail, webhook,
+#               zabbix_sender), agente Zabbix, container de relatorio de backup,
+#               remotes do rclone (nome e tipo, sem segredo) e discos cifrados
+#               (LUKS), para os campos "Monitoramento" e "Criptografia" da politica.
+#   [CRITICO]   Mascara igual a do orquestrador v3.8.
+#
 # Versao 1.3 (outubro/2026)
 #   [CRITICO]   Mascara igual a do orquestrador v3.7 (valores entre aspas, SENHA,
 #               KEY, --password, -P, Bearer, chave AWS).
@@ -79,15 +93,18 @@ run(){ # run "titulo" comando...
 # Regras de mascaramento de segredos, em arquivo para evitar inferno de quoting.
 SEDF="$OUT/.mascara.sed"
 cat > "$SEDF" <<'SEDEOF'
-s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
+s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|cipher[-_]?pass|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
 s/(--?(password|passwd|pwd|senha|token|secret)[[:space:]]+)("[^"]*"|'[^']*'|[^-[:space:]][^[:space:]]*)/\1***REMOVIDO***/Ig
 s/(identified[[:space:]]+by[[:space:]]+)("[^"]*"|[^[:space:];]+)/\1***REMOVIDO***/Ig
 s#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g
 s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}@#\1/***REMOVIDO***@#g
 s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig
 s#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s#((^|[[:space:]])(target|auxiliary|catalog)([[:space:]]+|[[:space:]]*=[[:space:]]*)["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s#((sqlplus|sqlldr|expdp|impdp|exp|imp|dgmgrl)([[:space:]]+-[A-Za-z]+)*[[:space:]]+["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#g
 s/(sqlcmd[^|;]*[[:space:]]-P[[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
 s/([[:space:]]-P[[:space:]]+)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/((mysql|mysqldump|mysqladmin|mysqlpump|mysqlcheck|mysqlbinlog|mariadb|mariadb-dump|mariadb-admin|mariabackup|xtrabackup|innobackupex|mydumper|myloader)[^|;]*[[:space:]]-p)("[^"]*"|'[^']*'|[^[:space:]"'-][^[:space:]]*)/\1***REMOVIDO***/g
 s/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1***REMOVIDO***/Ig
 s/(AKIA|ASIA)[0-9A-Z]{16}/\1***REMOVIDO***/g
 SEDEOF
@@ -113,6 +130,17 @@ run "Jobs em /etc/cron.d"        sh -c "ls -lah /etc/cron.d/ && grep -rH '' /etc
 run "Listagem cron.daily/weekly/monthly" sh -c "ls -lah /etc/cron.daily/ /etc/cron.weekly/ /etc/cron.monthly/ /etc/cron.hourly/ 2>/dev/null"
 run "Systemd timers (todos)"     systemctl list-timers --all --no-pager
 
+# Usuarios com crontab em /var/spool (RHEL: /var/spool/cron, Debian:
+# /var/spool/cron/crontabs). A lista fixa deixava de fora usuarios como
+# orabkp, wisedb ou relatorio.
+USERS_CRON="oracle mssql root postgres mysql veeam backup grid opc relatorio wisedb"
+for sp in /var/spool/cron /var/spool/cron/crontabs; do
+  for u in $( { ls -1 "$sp" 2>/dev/null || { [ -n "$SUDO" ] && $SUDO ls -1 "$sp" 2>/dev/null; }; } | grep -vE '^(crontabs|lastrun|\.)' ); do
+    USERS_CRON="$USERS_CRON $u"
+  done
+done
+USERS_CRON=$(printf '%s\n' $USERS_CRON | awk '!v[$0]++' | tr '\n' ' ')
+
 # Crontabs de outros usuarios relevantes (requer root; falha silenciosa se nao for)
 for u in oracle mssql root postgres mysql veeam backup; do
   run "Crontab do usuario $u (se root)" sh -c "crontab -l -u $u 2>/dev/null || echo 'Sem acesso ou usuario inexistente'"
@@ -125,7 +153,7 @@ if [ -n "$SUDO" ]; then
   run "Jobs em /etc/cron.d via sudo" sh -c "$SUDO ls -lah /etc/cron.d/ && $SUDO grep -rH '' /etc/cron.d/ 2>/dev/null"
   run "Listagem cron.hourly/daily/weekly/monthly via sudo" \
     sh -c "$SUDO ls -lah /etc/cron.hourly/ /etc/cron.daily/ /etc/cron.weekly/ /etc/cron.monthly/ 2>/dev/null"
-  for u in root oracle mssql postgres mysql veeam backup opc; do
+  for u in $USERS_CRON; do
     run "Crontab do usuario $u via sudo" \
       sh -c "$SUDO crontab -l -u $u 2>/dev/null || echo 'Sem crontab para $u'"
   done
@@ -163,6 +191,28 @@ run "Configuracao de SBT do DCS (Object Storage, Recovery Service e wallets)" sh
 # Extrai caminhos de scripts citados nos crontabs, copia o conteudo com
 # mascaramento de segredos e repete o processo para os scripts chamados dentro
 # deles (wrappers), ate 3 niveis de profundidade.
+# Destino de saida (> arquivo.sql, -f dump.sql, --result-file=) nao e script:
+# sem este filtro o dump gerado virava "script referenciado e nao encontrado".
+sem_saida(){ sed -E 's#(>>?|[[:space:]]-f|--file=|--result-file=|--output=|-o)[[:space:]]*/[^[:space:];|&]+##g'; }
+# Le arquivo com fallback para sudo (scripts de root costumam ser 700).
+rd(){ if [ -r "$1" ]; then cat "$1" 2>/dev/null; elif [ -n "$SUDO" ]; then $SUDO cat "$1" 2>/dev/null; fi; }
+existe(){ [ -f "$1" ] || { [ -n "$SUDO" ] && $SUDO test -f "$1" 2>/dev/null; }; }
+
+run "Anacrontab" sh -c "cat /etc/anacrontab 2>/dev/null || echo 'Sem /etc/anacrontab'"
+
+# systemd timers: o servico disparado pode ser a rotina de backup.
+TIMERS_TXT="$OUT/.timers.txt"; : > "$TIMERS_TXT"
+for tm in $(systemctl list-timers --all --no-legend --no-pager 2>/dev/null | grep -oE '[A-Za-z0-9@_.-]+\.timer' | sort -u); do
+  svc=$(systemctl show -p Unit --value "$tm" 2>/dev/null); svc="${svc:-${tm%.timer}.service}"
+  conteudo=$(systemctl cat "$tm" "$svc" 2>/dev/null)
+  if printf '%s\n%s\n' "$tm" "$conteudo" | grep -qiE 'backup|bkp|rman|dump|rsync|rclone|pgbackrest|barman|xtrabackup|mariabackup|snapshot|restic|borg'; then
+    { echo "## timer $tm -> $svc"; printf '%s\n' "$conteudo"; echo; } >> "$TIMERS_TXT"
+  fi
+done
+if [ -s "$TIMERS_TXT" ]; then
+  run "Systemd timers relacionados a backup (unidades completas)" cat "$TIMERS_TXT"
+fi
+
 SCRIPTS_DIR="$OUT/scripts_de_backup"
 mkdir -p "$SCRIPTS_DIR"
 LISTA="$OUT/lista_scripts_agendados.txt"
@@ -174,10 +224,27 @@ NOVOS="$OUT/.novos.txt"
 
 {
   crontab -l 2>/dev/null
-  cat /etc/crontab 2>/dev/null
-  grep -rh '' /etc/cron.d/ 2>/dev/null
-  ls -1 /etc/cron.daily/ /etc/cron.hourly/ /etc/cron.weekly/ /etc/cron.monthly/ 2>/dev/null
-} | grep -Eo '(/[A-Za-z0-9._/-]+\.(sh|bash|ksh|py|pl|rman|sql))' | sort -u > "$LISTA"
+  rd /etc/crontab
+  for f in /etc/cron.d/*; do [ -e "$f" ] && rd "$f"; done
+  rd /etc/anacrontab
+  for u in $USERS_CRON; do
+    [ "$u" = "$(whoami)" ] && continue
+    if [ "$(id -u)" = "0" ]; then crontab -l -u "$u" 2>/dev/null
+    elif [ -n "$SUDO" ]; then $SUDO crontab -l -u "$u" 2>/dev/null; fi
+  done
+  cat "$TIMERS_TXT" 2>/dev/null
+} 2>/dev/null | sem_saida | grep -Eo '(/[A-Za-z0-9._/-]+\.(sh|bash|ksh|py|pl|rman|sql))' | sort -u > "$LISTA"
+# /etc/cron.daily|weekly|...: o proprio arquivo e o script (sem extensao, em
+# geral). Entra na captura somente se tiver conteudo de backup.
+for d in /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+  for f in "$d"/*; do
+    [ -f "$f" ] || continue
+    # utilitarios do proprio SO que citam "backup" (dpkg, logrotate...) nao sao rotina do cliente
+    case "$(basename "$f")" in dpkg|logrotate|man-db|apt-compat|mlocate|plocate|sysstat|0anacron|bsdmainutils|passwd|apport|popularity-contest|rpm|tmpwatch|raid-check|0yum*|dnf-*|google-chrome*|exim4-base|locate|updatedb) continue;; esac
+    rd "$f" | grep -qiE 'backup|bkp|rman|expdp|dump|rsync|rclone|pgbackrest|barman|xtrabackup|mariabackup' && echo "$f"
+  done
+done >> "$LISTA"
+sort -u -o "$LISTA" "$LISTA"
 cp "$LISTA" "$PEND"
 
 NIVEL=0
@@ -188,25 +255,25 @@ while [ -s "$PEND" ] && [ "$NIVEL" -lt 3 ]; do
     [ -n "$scr" ] || continue
     grep -qxF "$scr" "$VISTOS" 2>/dev/null && continue
     echo "$scr" >> "$VISTOS"
-    if [ ! -f "$scr" ]; then
+    if ! existe "$scr"; then
       echo "$scr  (referenciado, nao existe ou sem permissao de leitura)" >> "$FALTA"
       continue
     fi
     base=$(echo "$scr" | tr '/' '_')
     {
       echo "## Origem: $scr"
-      echo "## stat: $(stat -c '%A %U %G %y' "$scr" 2>/dev/null)"
+      echo "## stat: $( { stat -c '%A %U %G %y' "$scr" 2>/dev/null || { [ -n "$SUDO" ] && $SUDO stat -c '%A %U %G %y' "$scr" 2>/dev/null; }; } )"
       echo "## nivel de referencia: $NIVEL"
       echo "## (conteudo com segredos mascarados)"
-      sed -E -f "$SEDF" "$scr" 2>/dev/null
+      rd "$scr" | sed -E -f "$SEDF" 2>/dev/null
       echo
     } > "$SCRIPTS_DIR/${base}.txt" 2>/dev/null
     # scripts, .rman e .sql chamados dentro deste script
-    grep -Eo '(/[A-Za-z0-9._/-]+\.(sh|bash|ksh|py|pl|rman|sql))' "$scr" 2>/dev/null >> "$NOVOS"
+    rd "$scr" | grep -v '^[[:space:]]*#' | sem_saida | grep -Eo '(/[A-Za-z0-9._/-]+\.(sh|bash|ksh|py|pl|rman|sql))' 2>/dev/null >> "$NOVOS"
   done < "$PEND"
   sort -u "$NOVOS" > "$PEND"
 done
-rm -f "$NOVOS" "$PEND"
+rm -f "$NOVOS" "$PEND" "$TIMERS_TXT"
 # Lista final consolidada (agendados + chamados por wrappers)
 sort -u "$VISTOS" > "$LISTA"
 rm -f "$VISTOS"
@@ -231,6 +298,50 @@ done
 
 # --- Processos/servicos de backup em execucao ----------------------------------
 run "Processos relacionados a backup" sh -c "ps -eo user,pid,lstart,cmd | grep -Ei 'rman|expdp|veeam|rsync|bacula|netbackup|commvault|restic|borg' | grep -v grep || echo 'Nenhum processo de backup em execucao agora'"
+
+# --- Monitoramento, notificacao, off-site e criptografia -------------------------
+# Campos "Monitoramento e alertas" e "Criptografia" da politica. Somente nomes,
+# tipos e destinos; nenhum segredo e lido (rclone listremotes nao mostra chave).
+MON="$OUT/monitoramento_backup.txt"
+{
+  echo "################ MONITORAMENTO, NOTIFICACAO, OFF-SITE E CRIPTOGRAFIA ################"
+  echo "## Coletado em: $(date '+%d/%m/%Y %H:%M:%S %Z') | Host: $HOSTN | Usuario: $(whoami)"
+  echo
+  echo "### NOTIFICACAO DENTRO DOS SCRIPTS DE BACKUP CAPTURADOS"
+  n=0
+  for f in "$SCRIPTS_DIR"/*.txt; do
+    [ -f "$f" ] || continue
+    h=$(grep -nE '(^|[^A-Za-z_])(mailx?|sendmail|mutt|msmtp|zabbix_sender|logger)([[:space:]]|$)|curl[^|;]*(hook|webhook|telegram|teams|slack|chat|api/)|wget[^|;]*(hook|telegram)' "$f" | grep -v '^[0-9]*:[[:space:]]*#' | head -5)
+    [ -n "$h" ] && { echo "-- $(basename "$f")"; echo "$h"; n=$((n+1)); }
+  done
+  [ "$n" = "0" ] && echo "(nenhum comando de notificacao nos scripts capturados)"
+  echo
+  echo "### AGENTE DE MONITORAMENTO"
+  ps -eo user,args 2>/dev/null | grep -E 'zabbix_agent|zabbix_agentd|zabbix_agent2|site24x7|datadog-agent|node_exporter|telegraf|oracle-cloud-agent' | grep -v grep | head -8
+  for c in /etc/zabbix/zabbix_agentd.conf /etc/zabbix/zabbix_agent2.conf /etc/zabbix_agentd.conf; do
+    [ -f "$c" ] && { echo "-- $c (Server/ServerActive/Hostname)"; grep -E '^(Server|ServerActive|Hostname)=' "$c" 2>/dev/null; }
+  done
+  echo
+  echo "### CONTAINERS DE RELATORIO/MONITORAMENTO DE BACKUP"
+  for c in docker podman; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    { $c ps -a --format '{{.Names}} | {{.Image}} | {{.Status}}' 2>/dev/null || { [ -n "$SUDO" ] && $SUDO $c ps -a --format '{{.Names}} | {{.Image}} | {{.Status}}' 2>/dev/null; }; } |
+      grep -iE 'backup|report|relatorio|monitor|zabbix' | head -10
+  done
+  echo
+  echo "### OFF-SITE: REMOTES DO RCLONE (nome e tipo, sem credencial)"
+  if command -v rclone >/dev/null 2>&1; then
+    rclone version 2>/dev/null | head -1
+    echo "-- usuario $(whoami):"; rclone listremotes --long 2>/dev/null || echo "(sem rclone.conf para este usuario)"
+    if [ -n "$SUDO" ]; then echo "-- root (via sudo):"; $SUDO rclone listremotes --long 2>/dev/null || echo "(sem rclone.conf para root)"; fi
+  else
+    echo "rclone nao instalado"
+  fi
+  for t in aws azcopy gsutil rsync restic borg; do command -v "$t" >/dev/null 2>&1 && echo "ferramenta de copia presente: $t ($(command -v "$t"))"; done
+  echo
+  echo "### CRIPTOGRAFIA EM REPOUSO (volumes LUKS / dm-crypt)"
+  lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT 2>/dev/null | grep -iE 'crypt|luks' || echo "(nenhum volume LUKS/dm-crypt visivel no lsblk)"
+} 2>&1 | sed -E -f "$SEDF" > "$MON"
 
 rm -f "$SEDF"
 log "Coleta geral concluida. Revise $OUT antes de enviar."

@@ -44,6 +44,14 @@
 #              alertas.txt | varredura.txt | cron_clone.txt | descartados.txt
 #              scripts_clone/ | extratos/
 #
+# Versao 1.3 (outubro/2026)
+#   [NOVO]      Restauracoes de PostgreSQL (pg_restore) e MySQL/MariaDB
+#               (xtrabackup/mariabackup --prepare/--copy-back, myloader) passam a
+#               ser descobertas e classificadas (POSTGRESQL, MYSQL). Antes so
+#               Oracle e SQL Server contavam como teste de restauracao.
+#   [CRITICO]   Mascara igual a do orquestrador v3.8 (mysqldump -pSENHA,
+#               rman target user/senha, sqlplus user/senha local, cipher-pass).
+#
 # Versao 1.2 (setembro/2026)
 #   [CORRIGIDO] Em instancia 12c o sqlplus devolvia o proprio texto do SELECT
 #               junto com o erro, e o texto era lido como sessao RMAN. Toda
@@ -100,31 +108,34 @@ existe(){ [ -e "$1" ] || { [ -n "$SUDO" ] && $SUDO test -e "$1" 2>/dev/null; }; 
 # sqlcmd -P, user/senha@, user/senha as sysdba e connect target user/senha.
 MASKF="$TMPD/mascara.sed"
 cat > "$MASKF" <<'SEDEOF'
-s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
+s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|cipher[-_]?pass|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
 s/(--?(password|passwd|pwd|senha|token|secret)[[:space:]]+)("[^"]*"|'[^']*'|[^-[:space:]][^[:space:]]*)/\1***REMOVIDO***/Ig
 s/(identified[[:space:]]+by[[:space:]]+)("[^"]*"|[^[:space:];]+)/\1***REMOVIDO***/Ig
 s#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g
 s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}@#\1/***REMOVIDO***@#g
 s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig
 s#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s#((^|[[:space:]])(target|auxiliary|catalog)([[:space:]]+|[[:space:]]*=[[:space:]]*)["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s#((sqlplus|sqlldr|expdp|impdp|exp|imp|dgmgrl)([[:space:]]+-[A-Za-z]+)*[[:space:]]+["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#g
 s/(sqlcmd[^|;]*[[:space:]]-P[[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
 s/([[:space:]]-P[[:space:]]+)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/((mysql|mysqldump|mysqladmin|mysqlpump|mysqlcheck|mysqlbinlog|mariadb|mariadb-dump|mariadb-admin|mariabackup|xtrabackup|innobackupex|mydumper|myloader)[^|;]*[[:space:]]-p)("[^"]*"|'[^']*'|[^[:space:]"'-][^[:space:]]*)/\1***REMOVIDO***/g
 s/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1***REMOVIDO***/Ig
 s/(AKIA|ASIA)[0-9A-Z]{16}/\1***REMOVIDO***/g
 SEDEOF
 mask(){ sed -E -f "$MASKF"; }
 
 # Marcadores. SCR_RX: comando de clone/restore em script. LOG_RX: execucao em log.
-SCR_RX='duplicate[[:space:]]+(target[[:space:]]+)?database|from[[:space:]]+active[[:space:]]+database|restore[[:space:]]+(clone[[:space:]]+)?(primary[[:space:]]+)?(database|controlfile)|(^|[[:space:]/])impdp[[:space:]]|RESTORE[[:space:]]+DATABASE[[:space:]]'
-LOG_RX='Starting Duplicate Db|Finished Duplicate Db|duplicate[[:space:]]+(target[[:space:]]+)?database|from active database|Starting restore at|Import: Release|RESTORE DATABASE successfully|restore[[:space:]]+(clone[[:space:]]+)?database'
-TIER1_RX='Duplicate Db|duplicate[[:space:]]+(target[[:space:]]+)?database|Import: Release|RESTORE DATABASE successfully|restore clone'
+SCR_RX='duplicate[[:space:]]+(target[[:space:]]+)?database|from[[:space:]]+active[[:space:]]+database|restore[[:space:]]+(clone[[:space:]]+)?(primary[[:space:]]+)?(database|controlfile)|(^|[[:space:]/])impdp[[:space:]]|RESTORE[[:space:]]+DATABASE[[:space:]]|(^|[[:space:]/])pg_restore[[:space:]]|(xtrabackup|mariabackup)[^|;]*--(prepare|copy-back|move-back)|(^|[[:space:]/])myloader[[:space:]]'
+LOG_RX='Starting Duplicate Db|Finished Duplicate Db|duplicate[[:space:]]+(target[[:space:]]+)?database|from active database|Starting restore at|Import: Release|RESTORE DATABASE successfully|restore[[:space:]]+(clone[[:space:]]+)?database|pg_restore: |Starting InnoDB instance for recovery|copy-back|Copying back'
+TIER1_RX='Duplicate Db|duplicate[[:space:]]+(target[[:space:]]+)?database|Import: Release|RESTORE DATABASE successfully|restore clone|pg_restore: |Starting InnoDB instance for recovery|copy-back'
 NOME_OUT='rclone|/kit_coleta_backup/|/wisedb-kit/|/[0-9]{2}_coleta_[a-z_]+\.(sh|ps1)$|/wisedb_coleta_auto|/wisedb_digest|/coleta_[^/]+_[0-9]{8}/|/\.config/|/\.cache/|/\.local/|/\.git/|/wisedb_coleta_|/09_restore/|\.(gz|zip|bz2|xz|tar|dmp|bkp|bak|dbf|arc|trc|trm|aud|so|jar|pyc)$'
 
 #---------------------------- 1. cron: rotinas agendadas -----------------------
 # Le o cron completo (nao so linhas com "clone"): a rotina pode se chamar
 # refresh_hml.sh, atualiza_base.sh, etc. O que decide e o conteudo do script.
 : > "$TMPD/cron_all"
-for u in $(printf '%s\n' "$(whoami)" oracle root grid | awk '!v[$0]++'); do
+for u in $(printf '%s\n' "$(whoami)" oracle root grid postgres mysql | awk '!v[$0]++'); do
   if [ "$u" = "$(whoami)" ]; then c=$(crontab -l 2>/dev/null)
   elif [ -n "$SUDO" ]; then c=$($SUDO crontab -l -u "$u" 2>/dev/null)
   else c=$(crontab -l -u "$u" 2>/dev/null); fi
@@ -436,6 +447,8 @@ analisa(){ # seg arquivo idx nsegs mtime dono
   local seg="$1" arq="$2" idx="$3" nseg="$4" mt="$5" dono="$6"
   local met status ori dst ini fim fonte dur durh loc tags tmin tmax dbk pec unt err toperr efet evb
   if grep -qiE 'from active database|using network backup set|from service |backup as copy reuse' "$seg"; then met="ACTIVE_DATABASE"
+  elif grep -qE 'pg_restore' "$seg"; then met="POSTGRESQL"
+  elif grep -qiE 'Starting InnoDB instance for recovery|copy-back|move-back|Copying back|myloader' "$seg"; then met="MYSQL"
   elif grep -qiE 'Duplicate Db|duplicate[[:space:]]+(target[[:space:]]+)?database|restore clone|RESTORE DATABASE successfully' "$seg" && \
        ! grep -qiE 'restore[^;]*validate' "$seg"; then
        if grep -qiE 'RESTORE DATABASE successfully|RESTORE LOG successfully' "$seg"; then met="SQLSERVER"; else met="BACKUP_RMAN"; fi
@@ -446,6 +459,18 @@ analisa(){ # seg arquivo idx nsegs mtime dono
   [ "$nseg" -gt 1 ] && [ "$met" = "INDETERMINADO" ] && return 0
 
   if [ -n "$FORCE_STATUS" ]; then status="$FORCE_STATUS"
+  elif [ "$met" = "POSTGRESQL" ]; then
+    # pg_restore nao imprime marcador de sucesso. Com -v, chegar as etapas
+    # pos-dados (indices/constraints) ou ao fim do loop paralelo sem nenhuma
+    # linha de erro e a evidencia mais forte disponivel em log.
+    if grep -qE 'errors ignored on restore: [1-9]' "$seg"; then status="SUCESSO_COM_ALERTAS"
+    elif grep -qE 'pg_restore: (error|\[archiver|FATAL)|could not connect' "$seg"; then status="FALHA"
+    elif grep -qE 'pg_restore: (finished main parallel loop|creating (INDEX|CONSTRAINT|FK CONSTRAINT|TRIGGER))' "$seg"; then status="SUCESSO"
+    else status="INCONCLUSIVO"; fi
+  elif [ "$met" = "MYSQL" ]; then
+    if grep -qE '\[ERROR\]|ERROR [0-9]{4}' "$seg"; then status="FALHA"
+    elif grep -qE 'completed OK!' "$seg"; then status="SUCESSO"
+    else status="INCONCLUSIVO"; fi
   elif grep -qiE 'RMAN-03002|RMAN-03009|failure of (duplicate|restore|recover)|RMAN-05501|RMAN-06054|RMAN-06026|job "[^"]*" (stopped|terminated)|terminating abnormally|ORA-01547|ORA-01194' "$seg"; then status="FALHA"
   elif grep -qiE 'completed with [1-9][0-9]* error' "$seg"; then status="SUCESSO_COM_ALERTAS"
   elif grep -qiE 'Finished Duplicate Db|Finished (restore|recover)|media recovery complete|database opened|successfully completed|successfully processed|Duplicate Db complete' "$seg"; then status="SUCESSO"
@@ -463,8 +488,13 @@ analisa(){ # seg arquivo idx nsegs mtime dono
   if [ -z "$fim" ] && [ -n "$ini" ] && [ "$idx" = "$nseg" ] && [ "$mt" -gt "$ini" ] && [ $((mt-ini)) -le 172800 ]; then
     fim="$mt"; fonte="inicio: log | fim: mtime do arquivo"
   fi
+  # Log sem nenhum horario (pg_restore e myloader nao datam as linhas): a data
+  # de modificacao do arquivo e a unica referencia de quando terminou.
+  if [ -z "$ini" ] && [ -z "$fim" ] && [ "$idx" = "$nseg" ] && [ -n "$mt" ]; then
+    fim="$mt"; fonte="log sem horario: fim = mtime do arquivo, inicio nao identificado"
+  fi
   if [ -n "$ini" ] && [ -n "$fim" ] && [ "$fim" -le "$ini" ]; then fonte="timestamps inconsistentes no log"; fi
-  [ -z "$ini" ] && fonte="inicio nao identificado no log"
+  [ -z "$ini" ] && [ "$fonte" = "log" ] && fonte="inicio nao identificado no log"
   dur=""; durh=""
   if [ -n "$ini" ] && [ -n "$fim" ] && [ "$fim" -gt "$ini" ]; then dur=$((fim-ini)); durh=$(hms "$dur"); fi
 
@@ -477,12 +507,17 @@ analisa(){ # seg arquivo idx nsegs mtime dono
   pec=$(grep -ciE 'reading from backup piece|restored backup piece' "$seg")
   unt=$(grep -oiE "until[[:space:]]+(time|scn|sequence)[^;)]*" "$seg" | head -1 | tr -s ' ')
   err=$(grep -oE '(ORA|RMAN)-[0-9]{5}' "$seg" | grep -vE 'RMAN-(00569|00571|07554)' | wc -l)
+  case "$met" in
+    POSTGRESQL) err=$(grep -cE 'pg_restore: (error|\[archiver)' "$seg");
+                dst=${dst:-$(grep -oE '(-d|--dbname)[= ]+[A-Za-z0-9_]+' "$seg" | head -1 | sed -E 's/^(-d|--dbname)[= ]+//')};;
+    MYSQL)      err=$(grep -cE '\[ERROR\]|ERROR [0-9]{4}' "$seg");;
+  esac
   toperr=$(grep -oE '(ORA|RMAN)-[0-9]{5}' "$seg" | grep -vE 'RMAN-(00569|00571|07554)' | sort | uniq -c | sort -rn | head -4 | awk '{printf "%s%s(%s)", (NR>1?", ":""), $2, $1}')
   local dpn dmp
   dpn=$(grep -oiE 'completed with [0-9]+ error' "$seg" | tail -1 | grep -oE '[0-9]+')
   [ -n "$dpn" ] && [ "$dpn" -gt "$err" ] && err="$dpn"
   dmp=$(grep -oiE 'dumpfile=[^[:space:]]+' "$seg" | head -1 | cut -d= -f2-)
-  case "$met" in BACKUP_RMAN|DATAPUMP|SQLSERVER) evb="SIM";; ACTIVE_DATABASE) evb="NAO";; RESTORE_VALIDATE) evb="PARCIAL";; *) evb="INDETERMINADO";; esac
+  case "$met" in BACKUP_RMAN|DATAPUMP|SQLSERVER|POSTGRESQL|MYSQL) evb="SIM";; ACTIVE_DATABASE) evb="NAO";; RESTORE_VALIDATE) evb="PARCIAL";; *) evb="INDETERMINADO";; esac
 
   ID=$((ID+1))
   printf '%s\t%s\t%s/%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -510,7 +545,7 @@ analisa(){ # seg arquivo idx nsegs mtime dono
   fi
 
   case "$met" in
-    BACKUP_RMAN|DATAPUMP|SQLSERVER)
+    BACKUP_RMAN|DATAPUMP|SQLSERVER|POSTGRESQL|MYSQL)
       case "$status" in
         SUCESSO) efet="Sim. Restauracao a partir de backup concluida com sucesso";;
         SUCESSO_COM_ALERTAS) efet="Sim, com ressalvas. Concluida com $err erro(s) registrados";;
@@ -532,6 +567,8 @@ analisa(){ # seg arquivo idx nsegs mtime dono
     case "$met" in
       SQLSERVER) echo " Servico de TI ...................: SQL Server | restore em ${dst:-destino nao identificado}";;
       DATAPUMP)  echo " Servico de TI ...................: Oracle Data Pump | importacao em ${dst:-destino nao identificado}";;
+      POSTGRESQL) echo " Servico de TI ...................: PostgreSQL | pg_restore em ${dst:-destino nao identificado}";;
+      MYSQL)     echo " Servico de TI ...................: MySQL/MariaDB | restauracao (xtrabackup/mariabackup/myloader)";;
       RESTORE_VALIDATE) echo " Servico de TI ...................: Oracle Database | validacao de backup${dst:+ de $dst}${ori:+ de $ori}";;
       *)         echo " Servico de TI ...................: Oracle Database | ${ori:-origem nao identificada} -> ${dst:-destino nao identificado}";;
     esac
@@ -554,7 +591,7 @@ analisa(){ # seg arquivo idx nsegs mtime dono
     esac
     [ -n "$dmp" ] && echo "   - Dump utilizado: $dmp"
     [ -n "$unt" ] && echo "   - Ponto de recuperacao: $unt"
-    echo "   - Erros ORA/RMAN: $err${toperr:+ ($toperr)}"
+    echo "   - Erros registrados (ORA/RMAN, pg_restore ou MySQL): $err${toperr:+ ($toperr)}"
     [ -n "$cr" ] && echo "   - Agendamento: $cr"
     [ "$FORCE_CF" = "1" ] && echo "   - Registro do controlfile do proprio banco: pode ser teste ou recuperacao real; confirmar com a equipe antes de usar como teste"
     echo "   - Evidencia: $arq (segmento $idx/$nseg); extrato_$(printf '%03d' "$ID").txt"
@@ -599,13 +636,15 @@ done < "$TMPD/sessoes_ord"
 
 #---------------------------- rotinas (scripts) descobertas --------------------
 {
-  echo "## Rotinas de clonagem/restauracao descobertas (scripts com comando DUPLICATE/RESTORE/impdp)"
+  echo "## Rotinas de clonagem/restauracao descobertas (DUPLICATE/RESTORE/impdp/pg_restore/xtrabackup/mariabackup/myloader)"
   sort -u "$TMPD/scripts" | sort -t'|' -k1,1nr | while IFS='|' read -r mt sz dono f; do
     [ -z "$f" ] && continue
     m="INDETERMINADO"
     if rd "$f" | grep -qiE 'from[[:space:]]+active[[:space:]]+database|from[[:space:]]+service'; then m="ACTIVE_DATABASE"
     elif rd "$f" | grep -qiE 'restore[^;]*validate'; then m="RESTORE_VALIDATE"
     elif rd "$f" | grep -qiE 'duplicate|restore[[:space:]]+(clone[[:space:]]+)?(database|controlfile)'; then m="BACKUP_RMAN"
+    elif rd "$f" | grep -qE 'pg_restore'; then m="POSTGRESQL"
+    elif rd "$f" | grep -qiE '(xtrabackup|mariabackup)[^|;]*--(prepare|copy-back|move-back)|myloader'; then m="MYSQL"
     elif rd "$f" | grep -qiE 'impdp'; then m="DATAPUMP"
     elif rd "$f" | grep -qiE 'RESTORE[[:space:]]+DATABASE'; then m="SQLSERVER"; fi
     echo "  $(fmt "$mt") | $m | origem da descoberta: ${ROT[$f]:-varredura} | $dono | $f"
@@ -721,6 +760,8 @@ done
   echo " Execucoes identificadas .....: $TOT"
   echo "   BACKUP_RMAN ...............: $(cnt 4 BACKUP_RMAN)   (valem como teste de restauracao)"
   echo "   DATAPUMP ..................: $(cnt 4 DATAPUMP)   (valem como teste do backup logico)"
+  echo "   POSTGRESQL ................: $(cnt 4 POSTGRESQL)   (pg_restore: valem como teste)"
+  echo "   MYSQL .....................: $(cnt 4 MYSQL)   (prepare/copy-back/myloader: valem como teste)"
   echo "   SQLSERVER .................: $(cnt 4 SQLSERVER)"
   echo "   RESTORE_VALIDATE ..........: $(cnt 4 RESTORE_VALIDATE)   (evidencia parcial)"
   echo "   ACTIVE_DATABASE ...........: $(cnt 4 ACTIVE_DATABASE)   (NAO valem como teste de restauracao)"
@@ -740,8 +781,8 @@ done
   echo "ALERTAS:"
   if [ -s "$OUT/alertas.txt" ]; then sed 's/^/  ! /' "$OUT/alertas.txt"; else echo "  (nenhum)"; fi
   echo
-  echo "NOTA PARA A IA: preencher o Anexo I somente com registros BACKUP_RMAN, DATAPUMP ou"
-  echo "SQLSERVER. ACTIVE_DATABASE e RESTORE_VALIDATE entram como observacao. RPO/RTO"
+  echo "NOTA PARA A IA: preencher o Anexo I somente com registros BACKUP_RMAN, DATAPUMP,"
+  echo "SQLSERVER, POSTGRESQL ou MYSQL. ACTIVE_DATABASE e RESTORE_VALIDATE entram como observacao. RPO/RTO"
   echo "acordados ficam A DEFINIR; os valores observados vao em Observacoes. Campos"
   echo "[A PREENCHER] nao devem ser inventados."
   echo

@@ -13,6 +13,28 @@
 #            O profile ~/.oci/config do cliente ja deve existir no servidor.
 # SAIDA    : ./coleta_oci_<profile>_<data>/
 #
+# Versao 1.3 (outubro/2026) - validado contra OCI CLI 3.95
+#   [CRITICO]   "oci db database list --all" nao existe (No such option '--all'):
+#               o backup config dos DB Systems (auto-backup, janela, retencao)
+#               NUNCA foi coletado. Corrigido, e incluidos ultimo backup e
+#               ultima falha de cada database e o destino (sem vpc-password).
+#   [CRITICO]   Recovery Service usava "recovery protected-database list" e
+#               "recovery protection-policy list", que nao existem. Corrigido
+#               para *-collection list-*; sem o grupo "recovery" no CLI (bastion
+#               antigo) a consulta vai por "oci raw-request".
+#   [CRITICO]   Replicacao de bucket usava "os replication-policy list", que nao
+#               existe. Corrigido para "os replication list-replication-policies"
+#               com fallback raw-request. Antes, nenhum bucket aparecia com
+#               replicacao, mesmo quando havia.
+#   [NOVO]      Data Guard associations dos DB Systems (prova de DR do banco).
+#   [NOVO]      Volume backups com expiracao e retention lock (imutabilidade).
+#   [NOVO]      Bucket: chave KMS e flag de replicacao no detalhe (JSON).
+#   [NOVO]      File Storage (FSS): file systems, politicas de snapshot,
+#               snapshots e replicacoes. Backups de Autonomous, MySQL HeatWave
+#               (politica, PITR, copia cross-region) e OCI PostgreSQL.
+#   [NOVO]      Sem namespace (profile nao autentica) o modulo retorna erro,
+#               para o orquestrador marcar a coleta como incompleta.
+#
 # Versao 1.2 (outubro/2026)
 #   [CORRIGIDO] bash 4.2 (OL/RHEL 7): tenancy sem bucket abortava o modulo em
 #               BUCKETS[@] unbound; DB Systems, Recovery Service e cross-region
@@ -39,6 +61,12 @@ OCI="oci --profile $PROFILE"
 [ -n "$REGION" ] && OCI="$OCI --region $REGION"
 OUT="./coleta_oci_${PROFILE}_$(date +%Y%m%d)"
 mkdir -p "$OUT"
+REG_PRIM="${REGION:-$(awk -v p="[$PROFILE]" '$0==p{f=1;next} /^\[/{f=0} f&&/^region/{sub(/.*=[[:space:]]*/,"");print;exit}' "${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)}"
+# Grupos de comando ausentes em CLI antigo (bastion com Python 3.6): detecta uma vez.
+tem_grupo(){ oci "$@" --help >/dev/null 2>&1; }
+TEM_RECOVERY=0; tem_grupo recovery protected-database-collection list-protected-databases && TEM_RECOVERY=1
+TEM_REPLIC=0;   tem_grupo os replication list-replication-policies && TEM_REPLIC=1
+TEM_RAW=0;      tem_grupo raw-request && TEM_RAW=1
 
 run(){ # run arquivo "titulo" comando completo (string)
   local f="$OUT/$1"; local t="$2"; shift 2
@@ -120,11 +148,17 @@ for C in "${COMPS[@]}"; do
 
   run 22_volume_backups_30d.txt "Boot volume backups (amostra recente, $C)" \
     "$OCI bv boot-volume-backup list --compartment-id $C --all --sort-by TIMECREATED --sort-order DESC \
-     --query 'data[0:25].{nome:\"display-name\", tipo:type, origem:\"source-type\", criado:\"time-created\", estado:\"lifecycle-state\", gb:\"unique-size-in-gbs\"}' --output table"
+     --query 'data[0:25].{nome:\"display-name\", tipo:type, origem:\"source-type\", criado:\"time-created\", estado:\"lifecycle-state\", gb:\"unique-size-in-gbs\"}' --output table; \
+     echo '-- Expiracao e retention lock (imutabilidade) dos 25 mais recentes:'; \
+     $OCI bv boot-volume-backup list --compartment-id $C --all --sort-by TIMECREATED --sort-order DESC \
+     --query 'data[0:25].{nome:\"display-name\", criado:\"time-created\", expira:\"expiration-time\", retention_lock:\"is-retention-lock-enabled\"}' --output table"
 
   run 23_block_volume_backups_30d.txt "Block volume backups (amostra recente, $C)" \
     "$OCI bv backup list --compartment-id $C --all --sort-by TIMECREATED --sort-order DESC \
-     --query 'data[0:25].{nome:\"display-name\", tipo:type, criado:\"time-created\", estado:\"lifecycle-state\"}' --output table"
+     --query 'data[0:25].{nome:\"display-name\", tipo:type, criado:\"time-created\", estado:\"lifecycle-state\"}' --output table; \
+     echo '-- Expiracao, origem e retention lock (imutabilidade) dos 25 mais recentes:'; \
+     $OCI bv backup list --compartment-id $C --all --sort-by TIMECREATED --sort-order DESC \
+     --query 'data[0:25].{nome:\"display-name\", criado:\"time-created\", origem:\"source-type\", expira:\"expiration-time\", retention_lock:\"is-retention-lock-enabled\"}' --output table"
 done
 
 run 24_politicas_backup_definidas.txt "Politicas de volume backup (Gold/Silver/Bronze e customizadas)" \
@@ -147,9 +181,9 @@ if [ -n "$BUCKET" ]; then BUCKETS=("$BUCKET"); else
   done | tr -d '",[] ' | grep -v '^$' | sort -u)
 fi
 for B in ${BUCKETS[@]+"${BUCKETS[@]}"}; do
-  run 31_bucket_${B}_detalhe.txt "Detalhe do bucket $B (versionamento, tier)" \
-    "$OCI os bucket get --bucket-name $B --namespace $NS \
-     --query 'data.{nome:name, versionamento:versioning, tier:\"storage-tier\", publico:\"public-access-type\"}' --output table"
+  run 31_bucket_${B}_detalhe.txt "Detalhe do bucket $B (versionamento, tier, KMS, replicacao)" \
+    "$OCI os bucket get --bucket-name $B --namespace $NS --fields approximateCount --fields approximateSize \
+     --query 'data.{nome:name, versionamento:versioning, tier:\"storage-tier\", publico:\"public-access-type\", kms:\"kms-key-id\", replicacao:\"replication-enabled\", objetos:\"approximate-count\", bytes:\"approximate-size\"}' --output json"
   run 31_bucket_${B}_lifecycle.txt "Lifecycle policy do bucket $B (expurgo automatico)" \
     "$OCI os object-lifecycle-policy get --bucket-name $B --namespace $NS --output json"
   run 31_bucket_${B}_retention.txt "Retention rules do bucket $B (IMUTABILIDADE)" \
@@ -185,9 +219,16 @@ for p in sorted(g):
 \" || echo '[AVISO] inventario completo falhou (bucket muito grande ou python3 ausente)'"
 
   # Replicacao: e a unica prova de copia cross-region no Object Storage.
-  run 31_bucket_${B}_replicacao.txt "Politica de replicacao do bucket $B (copia cross-region)" \
-    "$OCI os replication-policy list --bucket-name $B --namespace $NS --output json 2>/dev/null \
-     || echo 'Sem politica de replicacao neste bucket'"
+  if [ "$TEM_REPLIC" = "1" ]; then
+    run 31_bucket_${B}_replicacao.txt "Politica de replicacao do bucket $B (copia cross-region)" \
+      "$OCI os replication list-replication-policies --bucket-name $B --namespace $NS --all --output json"
+  elif [ "$TEM_RAW" = "1" ] && [ -n "$REG_PRIM" ]; then
+    run 31_bucket_${B}_replicacao.txt "Politica de replicacao do bucket $B (raw-request: CLI sem 'os replication')" \
+      "oci --profile $PROFILE raw-request --http-method GET --target-uri https://objectstorage.$REG_PRIM.oraclecloud.com/n/$NS/b/$B/replicationPolicies"
+  else
+    run 31_bucket_${B}_replicacao.txt "Politica de replicacao do bucket $B" \
+      "echo '[CLI DESATUALIZADO] sem os replication e sem raw-request: replicacao NAO evidenciada'"
+  fi
 done
 
 #--- 4. Bancos gerenciados pela OCI (DB Systems / Autonomous) -------------------
@@ -205,28 +246,100 @@ for C in "${COMPS[@]}"; do
   # Backup config de cada database do DB System: revela se o backup automatico
   # gerenciado esta habilitado, a janela e a retencao em dias. Sem isto nao se
   # distingue "banco sem backup gerenciado" de "banco com backup via RMAN proprio".
+  # "db database list" e um comando customizado do CLI: percorre os DB Homes do
+  # compartment e NAO aceita --all (com --all ele falha e nada era coletado).
   run 43_db_backup_config.txt "Backup config das databases dos DB Systems ($C)" \
-    "$OCI db database list --compartment-id $C --all \
+    "$OCI db database list --compartment-id $C \
        --query 'data[].{nome:\"db-name\", unique:\"db-unique-name\", estado:\"lifecycle-state\", \
                         auto:\"db-backup-config\".\"auto-backup-enabled\", \
                         janela:\"db-backup-config\".\"auto-backup-window\", \
                         retencao_dias:\"db-backup-config\".\"recovery-window-in-days\", \
-                        destino:\"db-backup-config\".\"backup-destination-details\"}' --output json"
+                        ultimo_backup:\"last-backup-timestamp\", ultima_falha:\"last-failed-backup-timestamp\", \
+                        destino:\"db-backup-config\".\"backup-destination-details\"[].{tipo:type, remoto:\"is-remote\", regiao_remota:\"remote-region\", retention_lock:\"is-retention-lock-enabled\"}}' --output json"
+  run 44_data_guard.txt "Data Guard associations das databases dos DB Systems ($C)" \
+    "for D in \$($OCI db database list --compartment-id $C --query 'data[].id' --raw-output 2>/dev/null | tr -d '\",[]' ); do \
+       echo \"-- database \$D\"; \
+       $OCI db data-guard-association list --database-id \$D --all \
+         --query 'data[].{papel:role, papel_par:\"peer-role\", modo:\"protection-mode\", transporte:\"transport-type\", lag_aplicacao:\"apply-lag\", estado:\"lifecycle-state\", par:\"peer-database-id\"}' --output table; \
+     done"
 
   # Recovery Service (DBRS): quando o RMAN esta com RETENTION POLICY TO NONE, a
   # janela de recuperacao real vive aqui. Sem este bloco a retencao do backup
   # fisico fica indeterminada.
-  run 45_recovery_service.txt "Recovery Service: bancos protegidos e politicas ($C)" \
-    "echo '-- Protected databases:'; \
-     $OCI recovery protected-database list --compartment-id $C --all \
-       --query 'data.items[].{nome:\"display-name\", estado:\"lifecycle-state\", saude:health, \
-                              politica:\"protection-policy-id\", tamanho_gb:\"database-size-in-gbs\", \
-                              retencao_atual:\"metrics\".\"retention-period-in-days\", \
-                              janela_recuperavel:\"metrics\".\"current-retention-period-in-seconds\"}' --output json; \
-     echo '-- Protection policies:'; \
-     $OCI recovery protection-policy list --compartment-id $C --all \
-       --query 'data.items[].{nome:\"display-name\", dias:\"backup-retention-period-in-days\", \
-                              predefinida:\"is-predefined-policy\", estado:\"lifecycle-state\"}' --output table"
+  if [ "$TEM_RECOVERY" = "1" ]; then
+    run 45_recovery_service.txt "Recovery Service: bancos protegidos e politicas ($C)" \
+      "echo '-- Protected databases:'; \
+       $OCI recovery protected-database-collection list-protected-databases --compartment-id $C --all \
+         --query 'data.items[].{nome:\"display-name\", estado:\"lifecycle-state\", saude:health, \
+                                politica:\"protection-policy-id\", tamanho_gb:\"database-size\", \
+                                retencao_atual:\"metrics\".\"retention-period-in-days\", \
+                                janela_recuperavel:\"metrics\".\"current-retention-period-in-seconds\", \
+                                janela_desprotegida_seg:\"metrics\".\"unprotected-window-in-seconds\", \
+                                redo_habilitado:\"metrics\".\"is-redo-logs-enabled\"}' --output json; \
+       echo '-- Protection policies:'; \
+       $OCI recovery protection-policy-collection list-protection-policies --compartment-id $C --all \
+         --query 'data.items[].{nome:\"display-name\", dias:\"backup-retention-period-in-days\", \
+                                predefinida:\"is-predefined-policy\", travada_em:\"policy-locked-date-time\", estado:\"lifecycle-state\"}' --output json"
+  elif [ "$TEM_RAW" = "1" ] && [ -n "$REG_PRIM" ]; then
+    run 45_recovery_service.txt "Recovery Service via raw-request (CLI sem o grupo 'recovery') ($C)" \
+      "echo '-- Protected databases (JSON da API, camelCase):'; \
+       oci --profile $PROFILE raw-request --http-method GET --target-uri 'https://recovery.$REG_PRIM.oci.oraclecloud.com/20210216/protectedDatabases?compartmentId=$C'; \
+       echo '-- Protection policies (JSON da API, camelCase):'; \
+       oci --profile $PROFILE raw-request --http-method GET --target-uri 'https://recovery.$REG_PRIM.oci.oraclecloud.com/20210216/protectionPolicies?compartmentId=$C'"
+  else
+    run 45_recovery_service.txt "Recovery Service ($C)" \
+      "echo '[CLI DESATUALIZADO] sem o grupo recovery e sem raw-request: Recovery Service NAO evidenciado'"
+  fi
+done
+
+#--- 4b. Outros servicos de banco gerenciado e File Storage --------------------
+for C in "${COMPS[@]}"; do
+  run 42b_autonomous_backups.txt "Backups de Autonomous Database ($C)" \
+    "$OCI db autonomous-database-backup list --compartment-id $C --all \
+     --query 'data[0:25].{nome:\"display-name\", tipo:type, automatico:\"is-automatic\", inicio:\"time-started\", estado:\"lifecycle-state\", retencao_dias:\"retention-period-in-days\", restauravel:\"is-restorable\"}' --output table"
+  # MySQL HeatWave: a politica de backup vem no proprio resumo do DB System
+  # (habilitado, retencao, janela, PITR e copia para outra regiao).
+  run 46_mysql_heatwave.txt "MySQL HeatWave: DB Systems, politica de backup e backups ($C)" \
+    "$OCI mysql db-system list --compartment-id $C --all \
+       --query 'data[].{nome:\"display-name\", estado:\"lifecycle-state\", versao:\"mysql-version\", ha:\"is-highly-available\", \
+                        backup_habilitado:\"backup-policy\".\"is-enabled\", retencao_dias:\"backup-policy\".\"retention-in-days\", \
+                        janela:\"backup-policy\".\"window-start-time\", pitr:\"backup-policy\".\"pitr-policy\".\"is-enabled\", \
+                        copia_regiao:\"backup-policy\".\"copy-policies\"[].\"copy-to-region\"}' --output json; \
+     echo '-- Backups (25 mais recentes):'; \
+     $OCI mysql backup list --compartment-id $C --all --sort-by timeCreated --sort-order DESC \
+       --query 'data[0:25].{nome:\"display-name\", tipo:\"backup-type\", criacao:\"creation-type\", criado:\"time-created\", estado:\"lifecycle-state\", retencao_dias:\"retention-in-days\", validacao:\"validation-status\"}' --output table"
+  if tem_grupo psql db-system-collection list-db-systems; then
+    run 47_oci_postgresql.txt "OCI Database with PostgreSQL: DB Systems e backups ($C)" \
+      "$OCI psql db-system-collection list-db-systems --compartment-id $C --all \
+         --query 'data.items[].{nome:\"display-name\", estado:\"lifecycle-state\", versao:\"db-version\", instancias:\"instance-count\"}' --output table; \
+       echo '-- Backups:'; \
+       $OCI psql backup-collection list-backups --compartment-id $C --all \
+         --query 'data.items[0:25].{nome:\"display-name\", origem:\"source-type\", criado:\"time-created\", estado:\"lifecycle-state\", retencao:\"retention-period\", copia:\"copy-status\"}' --output table"
+  fi
+  # File Storage: destino comum de dumps e archives (ex.: /Standby/ARCHIVELOGS).
+  # Snapshot de FSS nao e backup off-site, mas e a copia local mais comum.
+  run 60_fss.txt "File Storage (FSS): file systems, politicas de snapshot, snapshots e replicacoes ($C)" \
+    "for AD in \$($OCI iam availability-domain list --compartment-id $TENANCY --query 'data[].name' --raw-output | tr -d '\",[]' ); do \
+       echo \"-- AD \$AD | file systems:\"; \
+       $OCI fs file-system list --compartment-id $C --availability-domain \$AD --all \
+         --query 'data[].{nome:\"display-name\", ocid:id, gb:\"metered-bytes\", estado:\"lifecycle-state\", kms:\"kms-key-id\", replicacoes_origem:\"replication-source-count\"}' --output table; \
+       echo \"-- AD \$AD | politicas de snapshot:\"; \
+       $OCI fs filesystem-snapshot-policy list --compartment-id $C --availability-domain \$AD --all \
+         --query 'data[].{nome:\"display-name\", ocid:id, estado:\"lifecycle-state\", prefixo:\"policy-prefix\"}' --output table; \
+       for P in \$($OCI fs filesystem-snapshot-policy list --compartment-id $C --availability-domain \$AD --all --query 'data[].id' --raw-output 2>/dev/null | tr -d '\",[]' ); do \
+         echo \"-- schedules da politica \$P:\"; \
+         $OCI fs filesystem-snapshot-policy get --filesystem-snapshot-policy-id \$P \
+           --query 'data.schedules[].{periodo:period, hora:\"hour-of-day\", retencao_seg:\"retention-duration-in-seconds\"}' --output table; \
+       done; \
+       for FS in \$($OCI fs file-system list --compartment-id $C --availability-domain \$AD --all --query 'data[].id' --raw-output 2>/dev/null | tr -d '\",[]' ); do \
+         echo \"-- snapshots do file system \$FS (contagem, mais antigo, mais recente):\"; \
+         $OCI fs snapshot list --file-system-id \$FS --all \
+           --query '{total:length(data), mais_antigo:min_by(data,&\"time-created\").\"time-created\", mais_recente:max_by(data,&\"time-created\").\"time-created\", por_politica:length(data[?\"snapshot-type\"==\`POLICY_BASED\`])}' --output table; \
+       done; \
+       echo \"-- AD \$AD | replicacoes de file system (copia para outro AD/regiao):\"; \
+       $OCI fs replication list --compartment-id $C --availability-domain \$AD --all \
+         --query 'data[].{nome:\"display-name\", estado:\"lifecycle-state\", intervalo_min:\"replication-interval\", ponto_recuperacao:\"recovery-point-time\"}' --output table; \
+     done"
 done
 
 #--- 5. Copia cross-region: prova do criterio offsite do 3-2-1-1-0 --------------
@@ -249,7 +362,6 @@ run 50_cross_region.txt "Verificacao de copia cross-region (volume backups e DB 
 # A copia cross-region aparece na regiao de DESTINO, nao na de origem (licao do
 # Parecer R-001 Interne, sa-vinhedo-1). Consultar so a regiao primaria dava
 # falso negativo. Aqui cada regiao assinada alem da primaria e consultada.
-REG_PRIM="${REGION:-$(awk -v p="[$PROFILE]" '$0==p{f=1;next} /^\[/{f=0} f&&/^region/{sub(/.*=[[:space:]]*/,"");print;exit}' "${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)}"
 mapfile -t REGS_SUB < <(eval "oci --profile $PROFILE iam region-subscription list --query 'data[].\"region-name\"' --raw-output" 2>/dev/null | tr -d '",[] ' | grep -v '^$')
 for RG in ${REGS_SUB[@]+"${REGS_SUB[@]}"}; do
   [ "$RG" = "$REG_PRIM" ] && continue
@@ -262,5 +374,15 @@ for RG in ${REGS_SUB[@]+"${REGS_SUB[@]}"}; do
      done; echo '-- Lista vazia: nenhuma copia de volume desta tenancy chegou em $RG.'"
 done
 
+{ echo "## CAPACIDADES DO OCI CLI NESTE HOST"
+  echo "versao: $(oci --version 2>/dev/null | head -1)"
+  echo "grupo recovery: $([ "$TEM_RECOVERY" = "1" ] && echo SIM || echo NAO) | os replication: $([ "$TEM_REPLIC" = "1" ] && echo SIM || echo NAO) | raw-request: $([ "$TEM_RAW" = "1" ] && echo SIM || echo NAO)"
+  echo "regiao primaria: ${REG_PRIM:-nao identificada}"
+} > "$OUT/00_cli_capacidades.txt"
 echo "Coleta OCI concluida em $OUT. Revise os arquivos antes de enviar."
 echo "Nota: sintaxe de subcomandos pode variar entre versoes do OCI CLI; se um bloco falhar, envie o erro junto."
+if [ -z "$NS" ]; then
+  echo "[ERRO] Namespace do Object Storage nao obtido: o profile $PROFILE nao autenticou ou sem permissao." >&2
+  exit 2
+fi
+exit 0

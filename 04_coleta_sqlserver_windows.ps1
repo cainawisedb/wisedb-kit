@@ -23,6 +23,10 @@
 #>
 param([string[]]$Instancia = @(), [switch]$SkipVeeam)
 
+# v1.3 (outubro/2026): mesmos blocos do 03 v1.2 (lacuna de log, checksum, destino
+# VDI/URL, criptografia/TDE/certificados, historico de RESTORE, CHECKDB, paginas
+# suspeitas, Always On, log shipping, mirroring, resultado dos jobs do Agent).
+
 # v1.2 (outubro/2026): instancias nomeadas (MSSQL$NOME) detectadas sozinhas; antes
 # so a instancia padrao era consultada e servidor TOTVS/Express saia sem msdb.
 if ($Instancia.Count -eq 0) {
@@ -151,6 +155,85 @@ FROM msdb.dbo.sysjobs j
 LEFT JOIN msdb.dbo.sysjobschedules js ON js.job_id=j.job_id
 LEFT JOIN msdb.dbo.sysschedules s ON s.schedule_id=js.schedule_id
 ORDER BY j.name;
+"@
+"ULTIMO BACKUP POR BASE E TIPO (RPO E LACUNA DE LOG)" = @"
+SELECT d.name AS base, d.recovery_model_desc AS recovery,
+ CONVERT(varchar(16), MAX(CASE WHEN b.type='D' THEN b.backup_finish_date END), 120) AS ultimo_full,
+ CONVERT(varchar(16), MAX(CASE WHEN b.type='I' THEN b.backup_finish_date END), 120) AS ultimo_diff,
+ CONVERT(varchar(16), MAX(CASE WHEN b.type='L' THEN b.backup_finish_date END), 120) AS ultimo_log,
+ DATEDIFF(HOUR, MAX(CASE WHEN b.type IN ('D','I') THEN b.backup_finish_date END), GETDATE()) AS horas_desde_full_diff,
+ DATEDIFF(MINUTE, MAX(CASE WHEN b.type='L' THEN b.backup_finish_date END), GETDATE()) AS min_desde_log
+FROM sys.databases d LEFT JOIN msdb.dbo.backupset b ON b.database_name = d.name
+WHERE d.name <> 'tempdb'
+GROUP BY d.name, d.recovery_model_desc ORDER BY d.name;
+"@
+"QUALIDADE DOS BACKUPS - 15 DIAS (checksum, danificado, copy_only, compressao)" = @"
+SELECT database_name AS base,
+ CASE type WHEN 'D' THEN 'FULL' WHEN 'I' THEN 'DIFF' WHEN 'L' THEN 'LOG' ELSE type END AS tipo,
+ COUNT(*) AS backups,
+ SUM(CASE WHEN has_backup_checksums = 1 THEN 1 ELSE 0 END) AS com_checksum,
+ SUM(CASE WHEN is_damaged = 1 THEN 1 ELSE 0 END) AS danificados,
+ SUM(CASE WHEN is_copy_only = 1 THEN 1 ELSE 0 END) AS copy_only,
+ CAST(SUM(backup_size)/1024.0/1024/1024 AS decimal(12,2)) AS gb,
+ CAST(SUM(compressed_backup_size)/1024.0/1024/1024 AS decimal(12,2)) AS gb_comprimido
+FROM msdb.dbo.backupset
+WHERE backup_start_date >= DATEADD(DAY,-15,GETDATE())
+GROUP BY database_name, type ORDER BY 1,2;
+"@
+"TIPO DE DESTINO DOS BACKUPS - 15 DIAS (disco, VDI de terceiro, URL)" = @"
+SELECT CASE bmf.device_type WHEN 2 THEN 'DISCO' WHEN 5 THEN 'FITA' WHEN 7 THEN 'VIRTUAL (VDI: Veeam/Commvault/agente)' WHEN 9 THEN 'URL (Azure Blob/S3)' ELSE CAST(bmf.device_type AS varchar(10)) END AS tipo_destino,
+ COUNT(DISTINCT bs.backup_set_id) AS backups, MIN(bmf.physical_device_name) AS exemplo
+FROM msdb.dbo.backupset bs JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id
+WHERE bs.backup_start_date >= DATEADD(DAY,-15,GETDATE())
+GROUP BY bmf.device_type ORDER BY 2 DESC;
+"@
+"CRIPTOGRAFIA DO BACKUP, TDE E BACKUP DOS CERTIFICADOS" = @"
+IF COL_LENGTH('msdb.dbo.backupset','encryptor_type') IS NOT NULL
+BEGIN
+  EXEC('SELECT database_name AS base, ISNULL(encryptor_type,''NENHUMA'') AS criptografia, ISNULL(key_algorithm,''-'') AS algoritmo, COUNT(*) AS backups FROM msdb.dbo.backupset WHERE backup_start_date >= DATEADD(DAY,-15,GETDATE()) GROUP BY database_name, encryptor_type, key_algorithm ORDER BY 1')
+END
+ELSE
+BEGIN
+  SELECT 'Versao anterior ao SQL Server 2014: sem criptografia nativa de backup' AS criptografia
+END;
+IF COL_LENGTH('sys.certificates','pvt_key_last_backup_date') IS NOT NULL
+BEGIN
+  EXEC('SELECT name AS certificado, CONVERT(varchar(16), pvt_key_last_backup_date, 120) AS ultimo_backup_chave, CONVERT(varchar(10), expiry_date, 120) AS expira FROM master.sys.certificates WHERE name NOT LIKE ''##%''')
+END;
+SELECT DB_NAME(database_id) AS base_tde, encryption_state AS estado_tde FROM sys.dm_database_encryption_keys;
+"@
+"HISTORICO DE RESTORES - 365 DIAS (evidencia de teste de restauracao)" = @"
+SELECT TOP 40 CONVERT(varchar(16), rh.restore_date, 120) AS data_restore, rh.destination_database_name AS base_destino,
+ CASE rh.restore_type WHEN 'D' THEN 'DATABASE' WHEN 'I' THEN 'DIFERENCIAL' WHEN 'L' THEN 'LOG' WHEN 'F' THEN 'FILE' WHEN 'G' THEN 'FILEGROUP' WHEN 'V' THEN 'VERIFYONLY' ELSE rh.restore_type END AS tipo,
+ bs.database_name AS base_origem, bs.server_name AS servidor_origem,
+ CONVERT(varchar(16), bs.backup_finish_date, 120) AS backup_usado, rh.user_name AS executor
+FROM msdb.dbo.restorehistory rh LEFT JOIN msdb.dbo.backupset bs ON bs.backup_set_id = rh.backup_set_id
+WHERE rh.restore_date >= DATEADD(DAY,-365,GETDATE())
+ORDER BY rh.restore_date DESC;
+"@
+"INTEGRIDADE - ULTIMO CHECKDB SEM ERRO E PAGINAS SUSPEITAS" = @"
+SELECT name AS base, CONVERT(varchar(16), CAST(DATABASEPROPERTYEX(name,'LastGoodCheckDbTime') AS datetime), 120) AS ultimo_checkdb_ok
+FROM sys.databases WHERE name <> 'tempdb' AND state_desc = 'ONLINE' ORDER BY name;
+SELECT DB_NAME(database_id) AS base, file_id, page_id, event_type, error_count, CONVERT(varchar(16), last_update_date, 120) AS atualizado FROM msdb.dbo.suspect_pages;
+"@
+"ALTA DISPONIBILIDADE - ALWAYS ON, LOG SHIPPING E MIRRORING" = @"
+IF OBJECT_ID('sys.availability_groups') IS NOT NULL
+BEGIN
+  EXEC('SELECT ag.name AS ag, ag.automated_backup_preference_desc AS preferencia_backup, ar.replica_server_name AS replica, ar.availability_mode_desc AS modo, ISNULL(rs.role_desc,''-'') AS papel, ISNULL(rs.synchronization_health_desc,''-'') AS saude FROM sys.availability_groups ag JOIN sys.availability_replicas ar ON ar.group_id = ag.group_id LEFT JOIN sys.dm_hadr_availability_replica_states rs ON rs.replica_id = ar.replica_id ORDER BY ag.name, ar.replica_server_name')
+END;
+SELECT primary_server, primary_database, CONVERT(varchar(16), last_backup_date, 120) AS ultimo_backup_log, backup_threshold AS limite_min FROM msdb.dbo.log_shipping_monitor_primary;
+SELECT secondary_server, secondary_database, CONVERT(varchar(16), last_restored_date, 120) AS ultimo_restore, restore_threshold AS limite_min FROM msdb.dbo.log_shipping_monitor_secondary;
+SELECT DB_NAME(database_id) AS base, mirroring_role_desc AS papel, mirroring_state_desc AS estado, mirroring_partner_instance AS parceiro FROM sys.database_mirroring WHERE mirroring_guid IS NOT NULL;
+"@
+"RESULTADO DOS JOBS DO AGENT - 15 DIAS E RETENCAO DO HISTORICO NO MSDB" = @"
+SELECT j.name AS job,
+ SUM(CASE WHEN h.run_status = 1 THEN 1 ELSE 0 END) AS sucesso,
+ SUM(CASE WHEN h.run_status = 0 THEN 1 ELSE 0 END) AS falha,
+ MAX(h.run_date) AS ultima_data
+FROM msdb.dbo.sysjobs j JOIN msdb.dbo.sysjobhistory h ON h.job_id = j.job_id AND h.step_id = 0
+WHERE h.run_date >= CONVERT(int, CONVERT(char(8), DATEADD(DAY,-15,GETDATE()), 112))
+GROUP BY j.name ORDER BY j.name;
+SELECT CONVERT(varchar(16), MIN(backup_start_date), 120) AS backup_mais_antigo_no_historico, COUNT(*) AS registros FROM msdb.dbo.backupset;
 "@
 }
 if ($Instancia.Count -eq 0) {

@@ -12,6 +12,10 @@
               powershell -ExecutionPolicy Bypass -File .\06_coleta_veeam_vbr.ps1
  SAIDA    : .\coleta_<hostname>_<data>\06_veeam\
 
+ v1.2 (outubro/2026): SureBackup (jobs e sessoes), restauracoes executadas
+            (Get-VBRRestoreSession), backup da configuracao do VBR, criptografia
+            e health check por job. Sao as evidencias do "0" do 3-2-1-1-0 e
+            dos campos Criptografia e Backup do catalogo da politica.
  v1.1 (outubro/2026): RetainDaysToKeep deixava de ser rotulado como retencao do
             job (e o prazo de dados de VM removida); RetentionType exibido.
 
@@ -158,6 +162,59 @@ Try-Block "RESTORE POINTS MAIS RECENTES POR VM (janela real de recuperacao)" {
     $_.GetLastOibs($true) | Select-Object @{n='Job';e={$b}},
       @{n='VM';e={$_.Name}}, @{n='UltimoPonto';e={$_.CreationTime}}
   } | Sort-Object VM | Format-Table -Auto
+}
+
+Try-Block "CRIPTOGRAFIA E HEALTH CHECK POR JOB" {
+  $Jobs | ForEach-Object {
+    $o = $_.Options
+    [pscustomobject]@{
+      Job          = $_.Name
+      Criptografia = $o.BackupStorageOptions.StorageEncryptionEnabled
+      HealthCheck  = $o.GenerationPolicy.EnableRechek
+      Compressao   = $o.BackupStorageOptions.CompressionLevel
+    }
+  } | Format-Table -Auto
+}
+
+Try-Block "SUREBACKUP - JOBS (verificacao automatizada de restauracao)" {
+  $sbj = @()
+  if (Get-Command Get-VBRSureBackupJob -ErrorAction SilentlyContinue) { $sbj = @(Get-VBRSureBackupJob) }
+  elseif (Get-Command Get-VSBJob -ErrorAction SilentlyContinue) { $sbj = @(Get-VSBJob) }
+  if ($sbj.Count -eq 0) { "SUREBACKUP: nenhum job configurado (sem verificacao automatizada de restauracao)" }
+  else { $sbj | Select-Object Name, Description, LastRun, NextRun | Format-Table -Auto }
+}
+
+Try-Block "SUREBACKUP - SESSOES (90 DIAS)" {
+  $sbs = @()
+  if (Get-Command Get-VBRSureBackupSession -ErrorAction SilentlyContinue) { $sbs = @(Get-VBRSureBackupSession) }
+  elseif (Get-Command Get-VSBSession -ErrorAction SilentlyContinue) { $sbs = @(Get-VSBSession) }
+  $sbs = @($sbs | Where-Object { $_.CreationTime -gt (Get-Date).AddDays(-90) })
+  if ($sbs.Count -eq 0) { "SUREBACKUP: nenhuma sessao nos ultimos 90 dias" }
+  else { $sbs | Sort-Object CreationTime -Descending | Select-Object -First 30 Name, JobName, CreationTime, EndTime, Result, State | Format-Table -Auto }
+}
+
+Try-Block "RESTAURACOES EXECUTADAS (90 DIAS) - evidencia de teste de restauracao" {
+  Diga "  Lendo sessoes de restore (pode levar minutos em historico longo)..."
+  $rst = @(Get-VBRRestoreSession -ErrorAction Stop | Where-Object { $_.CreationTime -gt (Get-Date).AddDays(-90) })
+  if ($rst.Count -eq 0) { "RESTORE: nenhuma sessao de restauracao nos ultimos 90 dias" }
+  else { $rst | Sort-Object CreationTime -Descending | Select-Object -First 40 Name, JobTypeString, CreationTime, EndTime, Result, State | Format-Table -Auto }
+}
+
+Try-Block "BACKUP DA CONFIGURACAO DO VBR (catalogo da ferramenta)" {
+  $cb = Get-VBRConfigurationBackupJob -ErrorAction Stop
+  if (-not $cb) { "CONFIG BACKUP: job de backup da configuracao nao encontrado" }
+  else {
+    [pscustomobject]@{
+      Nome            = $cb.Name
+      Habilitado      = $cb.Enabled
+      Repositorio     = $cb.Repository.Name
+      PontosRetidos   = $cb.RestorePointsToKeep
+      Criptografado   = $cb.EncryptionOptions.Enabled
+      UltimoResultado = $cb.LastResult
+      UltimoEstado    = $cb.LastState
+      ProximaExecucao = $cb.NextRun
+    } | Format-List
+  }
 }
 
 Try-Block "VMs DO HYPERVISOR SEM JOB (gap de cobertura - comparar manualmente)" {

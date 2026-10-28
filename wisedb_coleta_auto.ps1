@@ -14,6 +14,16 @@
             6) GERA resultado_final.txt (colar na IA), resultado.json e .zip
  RISCO    : Zero. Somente leitura.
 
+ v2.4 (outubro/2026)
+   [CRITICO]  Mascara igual a do Linux v3.8: mysqldump -pSENHA, rman target
+              user/senha, sqlplus/expdp user/senha local e cipher-pass.
+   [NOVO]     Modulo 04 v1.3 (historico de RESTORE, lacuna de log, checksum,
+              criptografia/TDE, CHECKDB, Always On), 06 v1.2 (SureBackup,
+              restauracoes, backup da configuracao) e 10 v1.1 (retencao real,
+              TDE, standby; corrigida a classificacao do SBT).
+   [ALTERADO] PostgreSQL/MySQL em Windows continuam como alerta: os coletores
+              11/12 existem so para Linux.
+
  v2.3 (outubro/2026) - rodada de testes multiplataforma
    [CRITICO]  Mascara de segredos igual a do Linux v3.7 (SENHA, KEY, aspas,
               --password, -P do sqlcmd, user/senha@, Bearer, chave AWS). Pacote
@@ -37,7 +47,7 @@
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
 
 $BaseUrl = if ($env:WISEDB_BASE_URL) { $env:WISEDB_BASE_URL } else { "https://raw.githubusercontent.com/cainawisedb/wisedb-kit/main" }
-$Versao = "2.3"
+$Versao = "2.4"
 if ($PSVersionTable.PSVersion.Major -lt 3) {
   Write-Host "ERRO: PowerShell $($PSVersionTable.PSVersion) detectado. O kit exige 3.0+." -ForegroundColor Red
   Write-Host "Instale o WMF 5.1 (KB3191566) ou rode os modulos 04/06/07 manualmente." -ForegroundColor Red
@@ -164,7 +174,7 @@ foreach ($x in @(@('postgresql*','PostgreSQL','pg_dump/pgBackRest/Barman e agend
                  @('VeeamEndpointBackupSvc','Veeam Agent for Windows (standalone)','job, destino e ultimos resultados do Agent (console ou print)'))) {
   $sv = Svc $x[0]
   if ($sv.Count -gt 0) {
-    $a = "$($x[1]) ativo ($(($sv | ForEach-Object { $_.Name }) -join ', ')) sem coletor automatico no kit: anexar manualmente $($x[2])"
+    $a = "$($x[1]) ativo ($(($sv | ForEach-Object { $_.Name }) -join ', ')) sem coletor automatico para Windows (no Linux: modulos 11/12): anexar manualmente $($x[2])"
     $Alertas += $a; Write-Host "  ! $a" -ForegroundColor Yellow
   }
 }
@@ -287,15 +297,18 @@ $escopo | Out-File (Join-Path $Work "escopo_wizard.txt") -Encoding utf8
 
 function Protect-WiseText([string]$c) {
   if ($null -eq $c) { return $c }
-  $c = $c -replace '((?:[A-Za-z0-9_.-]*)(?:password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key)["'']?\s*[=:]\s*)("[^"]*"|''[^'']*''|[^\s",;]+)', '$1***REMOVIDO***'
+  $c = $c -replace '((?:[A-Za-z0-9_.-]*)(?:password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|cipher[-_]?pass|credential|api_?key|access_?key|key_id|keyid|private_?key|key)["'']?\s*[=:]\s*)("[^"]*"|''[^'']*''|[^\s",;]+)', '$1***REMOVIDO***'
   $c = $c -replace '(--?(?:password|passwd|pwd|senha|token|secret)\s+)("[^"]*"|''[^'']*''|[^-\s]\S*)', '$1***REMOVIDO***'
   $c = $c -replace '(identified\s+by\s+)("[^"]*"|[^\s;]+)', '$1***REMOVIDO***'
   $c = $c -replace '(//[^/:@\s]+:)[^@\s]+(@)', '$1***REMOVIDO***$2'
   $c = $c -replace '([A-Za-z0-9_.$]+)/[^\s/@"''*]{2,}@', '$1/***REMOVIDO***@'
   $c = $c -replace '([A-Za-z0-9_.$]+)/[^\s/@"''*]{2,}(\s+as\s+sys)', '$1/***REMOVIDO***$2'
   $c = $c -replace '((?:connect|conn)\s+(?:(?:target|auxiliary|catalog)\s+)?["'']?[A-Za-z0-9_.$]+)/[^\s@"'']+', '$1/***REMOVIDO***'
+  $c = $c -replace '((?:^|\s)(?:target|auxiliary|catalog)(?:\s+|\s*=\s*)["'']?[A-Za-z0-9_.$]+)/[^\s@"'']+', '$1/***REMOVIDO***'
+  $c = $c -creplace '((?:sqlplus|sqlldr|expdp|impdp|exp|imp|dgmgrl)(?:\s+-[A-Za-z]+)*\s+["'']?[A-Za-z0-9_.$]+)/[^\s@"'']+', '$1/***REMOVIDO***'
   $c = $c -creplace '(sqlcmd[^|;\r\n]*\s-P\s*)("[^"]*"|''[^'']*''|[^\s-]\S*)', '$1***REMOVIDO***'
   $c = $c -creplace '(\s-P\s+)("[^"]*"|''[^'']*''|[^\s-]\S*)', '$1***REMOVIDO***'
+  $c = $c -creplace '((?:mysql|mysqldump|mysqladmin|mysqlpump|mysqlcheck|mysqlbinlog|mariadb|mariadb-dump|mariadb-admin|mariabackup|xtrabackup|innobackupex|mydumper|myloader)(?:\.exe)?[^|;\r\n]*\s-p)("[^"]*"|''[^'']*''|[^\s"''-]\S*)', '$1***REMOVIDO***'
   $c = $c -replace '(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}', '$1***REMOVIDO***'
   $c = $c -creplace '(AKIA|ASIA)[0-9A-Z]{16}', '$1***REMOVIDO***'
   return $c
@@ -358,7 +371,7 @@ if ($Py) {
   if ($dg) {
     Diga "Gerando RESUMO com $Py"
     try { & $Py $dg $Work $Cliente "HOST_DO_CLIENTE" $Resumo } catch { Write-Host "  Digest nao gerado: $($_.Exception.Message)" -ForegroundColor Yellow }
-    if ((Test-Path $Resumo) -and -not (Select-String -Path $Resumo -Pattern '^== (SERVIDOR|ORACLE|SQL SERVER|VEEAM|OCI)' -Quiet)) {
+    if ((Test-Path $Resumo) -and -not (Select-String -Path $Resumo -Pattern '^== (SERVIDOR|ORACLE|SQL SERVER|VEEAM|OCI|HYPERVISOR|NUVEM)' -Quiet)) {
       Write-Host "  AVISO: RESUMO sem secoes de evidencia. Use o resultado_final.txt" -ForegroundColor Yellow
     }
   }

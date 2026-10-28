@@ -20,6 +20,24 @@
 #
 # RISCO: Zero no ambiente. Somente leitura.
 #
+# v3.8 (outubro/2026) - cobertura PostgreSQL/MySQL e correcoes validadas
+#   [NOVO]      Modulos 11 (PostgreSQL) e 12 (MySQL/MariaDB): o wizard detecta,
+#               pergunta se a instancia e do cliente (ou de ferramenta, como o
+#               Zabbix) e coleta WAL/binlog (PITR), replicacao, ferramentas de
+#               backup (pgBackRest, Barman, xtrabackup/mariabackup) e dumps.
+#               Antes PostgreSQL e MySQL so geravam alerta "nao coletado".
+#   [CRITICO]   Mascara: mysqldump -pSENHA (senha colada no -p), rman target
+#               user/senha sem @, sqlplus/expdp user/senha local e cipher-pass
+#               do pgBackRest passavam em texto claro.
+#   [CORRIGIDO] Conferencia de nome do cliente x tenancy rodava antes de o
+#               profile OCI ser escolhido (variavel vazia) e gerava alerta falso
+#               de troca de cliente. Agora roda depois da FASE 4.
+#   [CORRIGIDO] Host com PostgreSQL/MySQL e OCI CLI pontuava como bastion.
+#   [NOVO]      resultado.json registra os SGBDs detectados no host.
+#   [ALTERADO]  Modulo 05 v1.3: comandos OCI corrigidos (Recovery Service,
+#               replicacao de bucket e backup config dos DB Systems nunca eram
+#               coletados) e FSS, MySQL HeatWave, OCI PostgreSQL e Data Guard.
+#
 # v3.7 (outubro/2026) - rodada de testes multiplataforma
 #   [CRITICO]   Mascara de segredos reescrita: valores entre aspas (OCI_TOKEN="..",
 #               PASSWORD='..'), JSON/YAML, --password valor, -Psenha, Bearer e chave
@@ -120,7 +138,7 @@ COLETA_INCOMPLETA=0
 declare -a MODULOS_FALHARAM=()
 
 BASE_URL="${WISEDB_BASE_URL:-https://raw.githubusercontent.com/SUAORG/wisedb-kit/main}"
-VERSAO="3.7"
+VERSAO="3.8"
 HOSTN=$(hostname -s 2>/dev/null || hostname)
 FQDN=$(hostname -f 2>/dev/null || echo "$HOSTN")
 DATA=$(date +%Y%m%d)
@@ -422,12 +440,12 @@ MY_ON=0; PG_ON=0
 if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
   MY_ON=1; ok "MySQL/MariaDB ativo:"
   ps -eo user,pid,args 2>/dev/null | grep -E '^\S+ +[0-9]+ +\S*(mysqld|mariadbd)' | grep -v grep | head -3 | while read -r l; do info "  $l"; done
-  warn "Confirme se este MySQL/MariaDB pertence ao cliente ou e apoio de ferramenta (ex.: Zabbix). Rotina de dump/binlog nao e coletada automaticamente."
+  info "  Coletado pelo modulo 12 se confirmado como do cliente na FASE 4 (base de Zabbix/GLPI e ferramenta, nao cliente)"
 fi
 if pgrep -f 'postgres.*checkpointer' >/dev/null 2>&1; then
   PG_ON=1; ok "PostgreSQL ativo:"
   ps -eo user,pid,args 2>/dev/null | grep -E 'postgres' | grep -v grep | head -3 | while read -r l; do info "  $l"; done
-  warn "Confirme se este PostgreSQL pertence ao cliente ou e apoio de ferramenta. Rotina de pg_dump/WAL nao e coletada automaticamente."
+  info "  Coletado pelo modulo 11 se confirmado como do cliente na FASE 4"
 fi
 
 for c in docker podman; do
@@ -523,11 +541,12 @@ fi
 
 CLOUD_ALVOS=$(( ${#AWS_PROF[@]} + ${#GCP_CONF[@]} + ${#AZ_SUBID[@]} ))
 
-cq(){ crontab -l ${2:+-u "$2"} 2>/dev/null | grep -Eic 'backup|rman|expdp|dump|vzdump|rsync|oci os' || true; }
+BKP_RX='backup|rman|expdp|dump|vzdump|rsync|oci os|pgbackrest|barman|basebackup|mariabackup|xtrabackup|mydumper'
+cq(){ crontab -l 2>/dev/null | grep -Eic "$BKP_RX" || true; }
 q=$(cq); [ "${q:-0}" -gt 0 ] && CRON_HITS+=("$(whoami): $q linha(s)")
 for u in oracle root mssql postgres mysql backup relatorio; do
   [ "$u" = "$(whoami)" ] && continue
-  q=$(crontab -l -u "$u" 2>/dev/null | grep -Eic 'backup|rman|expdp|dump|vzdump|rsync|oci os' || true)
+  q=$(crontab -l -u "$u" 2>/dev/null | grep -Eic "$BKP_RX" || true)
   [ "${q:-0}" -gt 0 ] && CRON_HITS+=("$u: $q linha(s)")
 done
 q=$( { cat /etc/crontab 2>/dev/null; grep -rh '' /etc/cron.d/ 2>/dev/null; } | grep -Eic 'backup|rman|expdp|dump' || true)
@@ -566,7 +585,7 @@ SCORE_FERR=0; declare -a SINAIS=()
 [ "$MULTI_TENANT" = "1" ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#OCI_PROF[@]} profiles OCI de tenancies distintas no mesmo host"); }
 case "$HOSTN" in *bastion*|*jump*|*wise*|*monitor*|*zabbix*|*relatorio*|*mgmt*|*deploy*)
   SCORE_FERR=$((SCORE_FERR+2)); SINAIS+=("hostname sugere infraestrutura de gestao: $HOSTN");; esac
-if [ ${#OCI_PROF[@]} -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ]; then
+if [ ${#OCI_PROF[@]} -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ] && [ "$PG_ON" = "0" ] && [ "$MY_ON" = "0" ]; then
   SCORE_FERR=$((SCORE_FERR+1)); SINAIS+=("tem OCI CLI mas nenhum SGBD de producao local")
 fi
 # Um bastion com N contas AWS, N projetos GCP ou N subscriptions Azure e tao
@@ -575,7 +594,7 @@ fi
 [ ${#AWS_PROF[@]} -gt 1 ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#AWS_PROF[@]} profiles AWS de contas distintas no mesmo host"); }
 [ ${#GCP_CONF[@]} -gt 1 ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#GCP_CONF[@]} configurations gcloud no mesmo host"); }
 [ ${#AZ_SUBID[@]} -gt 1 ] && { SCORE_FERR=$((SCORE_FERR+3)); SINAIS+=("${#AZ_SUBID[@]} subscriptions Azure no mesmo host"); }
-if [ "$CLOUD_ALVOS" -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ]; then
+if [ "$CLOUD_ALVOS" -gt 0 ] && [ ${#ORA_SIDS[@]} -eq 0 ] && [ "$SQL_ON" = "0" ] && [ "$PG_ON" = "0" ] && [ "$MY_ON" = "0" ]; then
   SCORE_FERR=$((SCORE_FERR+1)); SINAIS+=("tem CLI de nuvem publica mas nenhum SGBD de producao local")
 fi
 
@@ -641,17 +660,8 @@ if [ "$COERENTE" = "0" ]; then
     casa_cliente "$p" && { COERENTE=1; ok "Nome do cliente compativel com o profile/conta '$p'"; break; }
   done
 fi
-if [ "$COERENTE" = "0" ]; then
-  # A tenancy do metadata local conferindo com a do profile escolhido e prova
-  # mais forte do que semelhanca de nome. Sem esta ressalva o wizard emitia
-  # "cliente nao aparece no hostname" em hosts legitimos, e o alerta falso
-  # chegava a virar pendencia no documento do cliente.
-  if [ -n "${VM_TENANCY:-}" ] && [ -n "${OCI_SEL_TEN:-}" ] && [ "$VM_TENANCY" = "$OCI_SEL_TEN" ]; then
-    ok "Nome do cliente nao casa com hostname nem profile, porem a tenancy do host confere com a do profile: escopo coerente"
-  else
-    warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
-  fi
-fi
+# A conferencia final (COERENTE=0) roda depois da FASE 4, quando o profile OCI
+# ja foi escolhido: antes disso OCI_SEL_TEN estava sempre vazio.
 # RPO/RTO sem valor default: o acordado fica A DEFINIR e o observado no
 # ambiente e calculado pelo modulo 09 (rpo_rto_observado.txt).
 RPO="A DEFINIR (observado: ver 09_restore/rpo_rto_observado.txt)"
@@ -863,6 +873,20 @@ fi
 [ "$COLETA_LOCAL" = "1" ] && [ "$SQL_ON" = "1" ] && \
   pergunta "Usuario de LEITURA do SQL Server (senha pedida na hora, nao e salva)" SQL_USER ""
 
+# PostgreSQL e MySQL/MariaDB: em servidor de cliente costumam ser producao; em
+# host de monitoramento costumam ser a base do Zabbix/GLPI. O operador decide.
+PG_SEL=0; MY_SEL=0
+if [ "$COLETA_LOCAL" = "1" ] && [ "$PG_ON" = "1" ]; then
+  pergunta "PostgreSQL deste host pertence ao cliente e entra na politica? (S/n)" RPG "S"
+  if [ "${RPG^^}" = "N" ]; then info "PostgreSQL marcado como fora do escopo"; EXCL+=("PostgreSQL local de $HOSTN|Declarado pelo operador como base de ferramenta / fora do escopo")
+  else PG_SEL=1; ok "PostgreSQL no escopo (modulo 11)"; fi
+fi
+if [ "$COLETA_LOCAL" = "1" ] && [ "$MY_ON" = "1" ]; then
+  pergunta "MySQL/MariaDB deste host pertence ao cliente e entra na politica? (S/n)" RMY "S"
+  if [ "${RMY^^}" = "N" ]; then info "MySQL/MariaDB marcado como fora do escopo"; EXCL+=("MySQL/MariaDB local de $HOSTN|Declarado pelo operador como base de ferramenta / fora do escopo")
+  else MY_SEL=1; ok "MySQL/MariaDB no escopo (modulo 12)"; fi
+fi
+
 if [ "$INTER" = "1" ]; then
   while :; do
     pergunta "Ambiente/base FORA do escopo da politica (nome, ENTER p/ seguir)" IT ""
@@ -872,6 +896,19 @@ if [ "$INTER" = "1" ]; then
   done
 fi
 fi # fim do escopo exclusivo do modo COMPLETA
+
+# Conferencia do nome do cliente, agora com o profile OCI ja escolhido. A
+# tenancy do metadata local conferindo com a do profile e prova mais forte do
+# que semelhanca de nome; alvo de nuvem confirmado pelo operador tambem conta.
+if [ "$COERENTE" = "0" ] && [ "$MODO" = "COMPLETA" ]; then
+  if [ -n "${VM_TENANCY:-}" ] && [ -n "${OCI_SEL_TEN:-}" ] && [ "$VM_TENANCY" = "$OCI_SEL_TEN" ]; then
+    ok "Nome do cliente nao casa com hostname nem profile, porem a tenancy do host confere com a do profile: escopo coerente"
+  elif [ -n "$OCI_SEL_PROF" ] || [ ${#CLOUD_SEL[@]} -gt 0 ]; then
+    info "Nome do cliente nao aparece no hostname; escopo de nuvem confirmado pelo operador nas perguntas acima"
+  else
+    warn "'$CLIENTE' nao aparece no hostname nem nos profiles: confirme que nao houve troca de cliente"
+  fi
+fi
 
 # Evidencias de restauracao (modulo 09): somente onde a clonagem roda, ou seja,
 # em host do cliente ou misto. Em estacao de coleta nao ha log de clone do cliente.
@@ -895,6 +932,8 @@ say "  Papel do host .....: ${NEG}$PAPEL${R}"
 say "  Coleta local ......: $([ "$COLETA_LOCAL" = "1" ] && echo "${VERD}SIM${R}" || echo "${VERM}NAO (host de ferramenta)${R}")"
 [ ${#ORA_SEL[@]} -gt 0 ] && say "  Oracle ............: ${ORA_SEL[*]}"
 [ -n "$SQL_USER" ] && say "  SQL Server ........: usuario $SQL_USER"
+[ "${PG_SEL:-0}" = "1" ] && say "  PostgreSQL ........: SIM (modulo 11)"
+[ "${MY_SEL:-0}" = "1" ] && say "  MySQL/MariaDB .....: SIM (modulo 12)"
 [ ${#DIR_SEL[@]} -gt 0 ] && say "  Diretorios ........: ${DIR_SEL[*]}"
 [ "$MODO" = "COMPLETA" ] && say "  OCI ...............: ${OCI_SEL_PROF:-nao sera coletado}${OCI_SEL_PROF:+ (tenancy ...${OCI_SEL_TEN: -12})}"
 if [ "$MODO" = "RESTORE" ]; then
@@ -950,6 +989,18 @@ if [ "$COLETA_LOCAL" = "1" ]; then
     if dl 03_coleta_sqlserver_linux.sh; then
       SQL_PORTA=$(printf '%s\n' ${SQL_PORTAS[@]+"${SQL_PORTAS[@]}"} | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1)
       if bash "$TMP/03_coleta_sqlserver_linux.sh" "localhost,${SQL_PORTA:-1433}" "$SQL_USER"; then ok "SQL Server coletado"; else erro "Modulo SQL Server falhou durante a coleta"; MODULOS_FALHARAM+=("03_coleta_sqlserver_linux.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+    fi
+  fi
+  if [ "${PG_SEL:-0}" = "1" ]; then
+    info "Coleta PostgreSQL (como postgres, root ou sudo -u postgres; senao WISEDB_PG_CONN)"
+    if dl 11_coleta_postgresql.sh; then
+      if bash "$TMP/11_coleta_postgresql.sh"; then ok "PostgreSQL coletado"; else erro "Modulo 11 (PostgreSQL) terminou com erro"; MODULOS_FALHARAM+=("11_coleta_postgresql.sh(execucao)"); COLETA_INCOMPLETA=1; fi
+    fi
+  fi
+  if [ "${MY_SEL:-0}" = "1" ]; then
+    info "Coleta MySQL/MariaDB (root/unix_socket, sudo, ~/.my.cnf ou usuario de leitura pedido agora)"
+    if dl 12_coleta_mysql.sh; then
+      if bash "$TMP/12_coleta_mysql.sh"; then ok "MySQL/MariaDB coletado"; else erro "Modulo 12 (MySQL/MariaDB) terminou com erro"; MODULOS_FALHARAM+=("12_coleta_mysql.sh(execucao)"); COLETA_INCOMPLETA=1; fi
     fi
   fi
   if [ "$HYP_ON" = "1" ]; then
@@ -1041,6 +1092,7 @@ fi
   echo "Papel do host ......: $PAPEL"
   echo "Usuario / sudo .....: $(whoami) / $([ "$WISEDB_SUDO" = "1" ] && echo SIM || echo NAO)"
   echo "Oracle no escopo ...: ${ORA_SEL[*]:-nenhum}"
+  echo "PostgreSQL/MySQL ...: $([ "${PG_SEL:-0}" = "1" ] && echo "PostgreSQL ")$([ "${MY_SEL:-0}" = "1" ] && echo "MySQL/MariaDB")"
   echo "Profile OCI ........: ${OCI_SEL_PROF:-nenhum}"
   echo "Coleta incompleta ..: $([ "$COLETA_INCOMPLETA" = "1" ] && echo "SIM (${MODULOS_FALHARAM[*]})" || echo NAO)"
   echo "Fora do escopo (declarado pelo operador, NAO tratar como servico assegurado):"
@@ -1064,15 +1116,18 @@ titulo "FASE 7 - SANITIZACAO E CONSOLIDACAO"
 # segredo saia no pacote (mesmo padrao do vazamento DBS Partner, set/2026).
 MASK_SED="$WORK/.mascara.sed"
 cat > "$MASK_SED" <<'SEDEOF'
-s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
+s/(([A-Za-z0-9_.-]*(password|passwd|pwd|senha|secret|token|passphrase|pass_phrase|cipher[-_]?pass|credential|api_?key|access_?key|key_id|keyid|private_?key|key))["']?[[:space:]]*[=:][[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]",;]+)/\1***REMOVIDO***/Ig
 s/(--?(password|passwd|pwd|senha|token|secret)[[:space:]]+)("[^"]*"|'[^']*'|[^-[:space:]][^[:space:]]*)/\1***REMOVIDO***/Ig
 s/(identified[[:space:]]+by[[:space:]]+)("[^"]*"|[^[:space:];]+)/\1***REMOVIDO***/Ig
 s#(//[^/:@[:space:]]+:)[^@[:space:]]+(@)#\1***REMOVIDO***\2#g
 s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}@#\1/***REMOVIDO***@#g
 s#([A-Za-z0-9_.$]+)/[^[:space:]/@"'*]{2,}([[:space:]]+as[[:space:]]+sys)#\1/***REMOVIDO***\2#Ig
 s#((connect|conn)[[:space:]]+((target|auxiliary|catalog)[[:space:]]+)?["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s#((^|[[:space:]])(target|auxiliary|catalog)([[:space:]]+|[[:space:]]*=[[:space:]]*)["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#Ig
+s#((sqlplus|sqlldr|expdp|impdp|exp|imp|dgmgrl)([[:space:]]+-[A-Za-z]+)*[[:space:]]+["']?[A-Za-z0-9_.$]+)/[^[:space:]@"']+#\1/***REMOVIDO***#g
 s/(sqlcmd[^|;]*[[:space:]]-P[[:space:]]*)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
 s/([[:space:]]-P[[:space:]]+)("[^"]*"|'[^']*'|[^[:space:]-][^[:space:]]*)/\1***REMOVIDO***/g
+s/((mysql|mysqldump|mysqladmin|mysqlpump|mysqlcheck|mysqlbinlog|mariadb|mariadb-dump|mariadb-admin|mariabackup|xtrabackup|innobackupex|mydumper|myloader)[^|;]*[[:space:]]-p)("[^"]*"|'[^']*'|[^[:space:]"'-][^[:space:]]*)/\1***REMOVIDO***/g
 s/(Bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]{8,}/\1***REMOVIDO***/Ig
 s/(AKIA|ASIA)[0-9A-Z]{16}/\1***REMOVIDO***/g
 SEDEOF
@@ -1122,6 +1177,7 @@ FINAL="$WORK/resultado_final.txt"
   done
 } > "$FINAL"
 
+WISEDB_SGBD="oracle=${#ORA_SIDS[@]};sqlserver=$SQL_ON;postgresql=$PG_ON;mysql=$MY_ON" \
 WISEDB_MODO_COLETA="$MODO" WISEDB_VERSAO="$VERSAO" \
 python3 - "$WORK" "$CLIENTE" "$PAPEL" "$COLETA_LOCAL" "$OCI_SEL_PROF" "$OCI_SEL_TEN" "$VM_TENANCY" "$RPO" "$RTO" "$MD_CONFIAVEL" <<'PYEOF' 2>/dev/null || warn "python3 ausente: resultado.json nao gerado (o .txt esta completo)"
 import json, os, sys, datetime
@@ -1156,6 +1212,7 @@ doc = {
             "coleta_local_habilitada": local == "1",
             "data": datetime.datetime.now().isoformat(timespec="minutes"),
             "script_versao": os.environ.get("WISEDB_VERSAO", "?")},
+ "sgbd_detectados_no_host": dict((k, int(v)) for k, v in (x.split("=") for x in os.environ.get("WISEDB_SGBD", "").split(";") if "=" in x)),
  "evidencias_restore": rst,
  "oci": {"profile_usado": prof or None, "tenancy_profile": ten or None,
          "tenancy_reportada_pelo_metadata": vmten or None,
@@ -1192,7 +1249,7 @@ elif dl wisedb_digest.py 2>/dev/null; then
     || warn "Digest nao gerado; use o resultado_final.txt"
   # o digest v2.1 resolve sozinho a subpasta coleta_<host>_<data>; se ainda assim
   # o resumo sair sem secao de evidencia, avisa em vez de entregar resumo vazio
-  if [ -s "$RESUMO" ] && ! grep -qE '^== (SERVIDOR|ORACLE|SQL SERVER|OCI)' "$RESUMO"; then
+  if [ -s "$RESUMO" ] && ! grep -qE '^== (SERVIDOR|ORACLE|SQL SERVER|OCI|POSTGRESQL|MYSQL|NUVEM|VEEAM|HYPERVISOR)' "$RESUMO"; then
     warn "RESUMO sem secoes de evidencia. Verifique $WORK e use o resultado_final.txt"
   fi
 fi

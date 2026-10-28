@@ -24,6 +24,13 @@
 #              bash 08_coleta_cloud_outras.sh aws PERFIL sa-east-1
 #              bash 08_coleta_cloud_outras.sh azure <subscription_id>
 # SAIDA    : ./coleta_cloud_<provedor>_<identificador>_<data>/
+#
+# v2.1 (outubro/2026)
+#   [NOVO] AWS: restore jobs (90 dias) e restore testing plans (teste de
+#          restauracao automatizado = o "0" do 3-2-1-1-0), tipo do vault
+#          (logically air-gapped) e criptografia padrao dos buckets S3.
+#   [NOVO] Azure: imutabilidade, soft delete e redundancia (LRS/GRS/ZRS e
+#          cross region restore) de cada Recovery Services Vault.
 #===============================================================================
 set -uo pipefail
 
@@ -68,6 +75,7 @@ run(){ local f="$OUT/$1"; local t="$2"; shift 2
 coleta_aws(){
   local P="${PROFILE:-default}" AQ
   local D14; D14=$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+  local D90; D90=$(date -u -d '90 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
   local A="aws --profile $P --no-cli-pager --cli-connect-timeout 5 --cli-read-timeout 30 --output table"
   local base n b d r
 
@@ -104,7 +112,8 @@ coleta_aws(){
          echo '--- versionamento ---';  $A --region $R1 s3api get-bucket-versioning --bucket $B; \
          echo '--- object lock ---';    $A --region $R1 s3api get-object-lock-configuration --bucket $B; \
          echo '--- lifecycle ---';      $A --region $R1 s3api get-bucket-lifecycle-configuration --bucket $B --output json; \
-         echo '--- replicacao ---';     $A --region $R1 s3api get-bucket-replication --bucket $B --output json"
+         echo '--- replicacao ---';     $A --region $R1 s3api get-bucket-replication --bucket $B --output json; \
+         echo '--- criptografia ---';   $A --region $R1 s3api get-bucket-encryption --bucket $B --output json"
   done
 
   for R in $REGIONS; do
@@ -117,7 +126,7 @@ coleta_aws(){
          --query 'Volumes[].{volume:VolumeId, tamanhoGB:Size, tipo:VolumeType, estado:State, anexadoA:Attachments[0].InstanceId}'"
     run "aws_20_${R}_backup_vaults.txt" "AWS Backup em $R: vaults (Locked = imutabilidade)" \
         "$AR backup list-backup-vaults \
-         --query 'BackupVaultList[].{vault:BackupVaultName, pontos:NumberOfRecoveryPoints, lockImutavel:Locked, lockMinDias:MinRetentionDays, lockMaxDias:MaxRetentionDays}'"
+         --query 'BackupVaultList[].{vault:BackupVaultName, tipo:VaultType, pontos:NumberOfRecoveryPoints, lockImutavel:Locked, lockMinDias:MinRetentionDays, lockMaxDias:MaxRetentionDays}'"
     run "aws_21_${R}_backup_planos.txt" "AWS Backup em $R: planos" \
         "$AR backup list-backup-plans --query 'BackupPlansList[].{plano:BackupPlanName, id:BackupPlanId, ultimaExec:LastExecutionDate}'"
     for PID in $(aws --profile "$P" --region "$R" backup list-backup-plans --output text --query 'BackupPlansList[].BackupPlanId' 2>/dev/null); do
@@ -133,6 +142,12 @@ coleta_aws(){
     run "aws_25_${R}_jobs_copia.txt" "AWS Backup em $R: copy jobs (off-site / cross-region)" \
         "$AR backup list-copy-jobs --by-created-after $D14 \
          --query 'CopyJobs[].{origem:SourceBackupVaultArn, destino:DestinationBackupVaultArn, estado:State, inicio:CreationDate}'"
+    run "aws_28_${R}_restore_jobs90d.txt" "AWS Backup em $R: restauracoes dos ultimos 90 dias (evidencia de teste)" \
+        "$AR backup list-restore-jobs --by-created-after $D90 \
+         --query 'RestoreJobs[].{recurso:CreatedResourceArn, tipo:ResourceType, estado:Status, inicio:CreationDate, fim:CompletionDate, validacao:ValidationStatus}'"
+    run "aws_29_${R}_restore_testing.txt" "AWS Backup em $R: restore testing plans (teste de restauracao automatizado)" \
+        "$AR backup list-restore-testing-plans \
+         --query 'RestoreTestingPlans[].{plano:RestoreTestingPlanName, agenda:ScheduleExpression, ultimaExec:LastExecutionTime}'"
     run "aws_26_${R}_snapshots_ebs.txt" "Snapshots EBS proprios em $R (amostra recente)" \
         "$AR ec2 describe-snapshots --owner-ids self --max-items 60 \
          --query 'Snapshots[].{id:SnapshotId, volume:VolumeId, criado:StartTime, estado:State, descricao:Description}'"
@@ -219,6 +234,10 @@ coleta_azure(){
     run "azure_21_${V}_politicas.txt" "Politicas do vault $V (agendamento e retencao)" \
         "$AZ backup policy list --vault-name $V --resource-group $RG \
          --query '[].{politica:name, tipo:properties.backupManagementType, agenda:properties.schedulePolicy, retencao:properties.retentionPolicy}' -o json"
+    run "azure_21b_${V}_seguranca.txt" "Vault $V: imutabilidade, soft delete e redundancia (LRS/GRS, cross region restore)" \
+        "$AZ backup vault show --name $V --resource-group $RG \
+         --query '{imutabilidade:properties.securitySettings.immutabilitySettings.state, softDelete:properties.securitySettings.softDeleteSettings.softDeleteState, redundancia:properties.redundancySettings}' -o json; \
+         $AZ backup vault backup-properties show --name $V --resource-group $RG -o json"
     run "azure_22_${V}_itens.txt" "Itens protegidos no vault $V" \
         "$AZ backup item list --vault-name $V --resource-group $RG \
          --query '[].{item:properties.friendlyName, tipo:properties.workloadType, saude:properties.protectionStatus, ultimoBackup:properties.lastBackupTime, politica:properties.policyName}' -o table"

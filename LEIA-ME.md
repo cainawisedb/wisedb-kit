@@ -19,6 +19,16 @@ powershell -ExecutionPolicy Bypass -File ".\wisedb_coleta_auto.ps1"
 ```
 Manual completo do fluxo para colaboradores: M-001 v2.0.
 
+### Ambiente sem internet (ex.: acesso só por PAM/senhasegura)
+
+Não use o `wisedb-kit-offline.tar.gz`: ele parou na v3.3 (setembro/2026), não tem os módulos 08 a 12 e usa a máscara antiga de segredos (a que deixou passar o `OCI_TOKEN`). Baixe o repositório atual pelo botão **Code > Download ZIP** do GitHub, leve os arquivos para uma pasta do servidor e rode de dentro dela:
+
+```bash
+cd /caminho/da/pasta/do/kit && bash wisedb_coleta_auto.sh
+```
+
+O orquestrador usa os módulos da própria pasta (eles têm prioridade sobre o download). O aviso "Nao foi possivel baixar modulos" é esperado nesse modo e não afeta a coleta.
+
 Para apontar outro repositório sem editar o script: `export WISEDB_BASE_URL="https://.../kit_coleta_backup"` antes de rodar (Linux) ou `$env:WISEDB_BASE_URL = "..."` (Windows). Repositório privado funciona incluindo o token de leitura na URL raw.
 
 
@@ -55,7 +65,9 @@ Todos os scripts são **somente leitura** e seguros para produção. Nenhum dele
 | 7b | `07_coleta_hypervisor_linux.sh` | Host Proxmox/PBS/KVM (root) | Jobs vzdump, retenção (prune), verify/sync do PBS, VMs sem backup, snapshots libvirt |
 | 8 | `08_coleta_cloud_outras.sh` | Servidor central com az/aws CLI | Se houver VMs em Azure (Recovery Services Vault) ou AWS (AWS Backup, EBS snapshots, DLM) |
 | 8b | `10_coleta_oracle_windows.ps1` | Servidor Windows com OracleService* (PowerShell admin, grupo ORA_DBA) | Equivalente Windows do 02 (RMAN, 35 dias, archive, FRA, Data Guard, Data Pump). Chamado automaticamente pelo orquestrador |
-| 9 | `09_coleta_evidencias_restore.sh` | Servidor onde a clonagem executa (usuário `oracle`) | Evidências de teste de restauração (Anexo I) com descoberta automática: cron e scripts chamados, varredura por conteúdo e `v$rman_status` dos bancos locais. Classifica BACKUP_RMAN x ACTIVE_DATABASE x DATAPUMP x SQLSERVER x RESTORE_VALIDATE. RPO/RTO acordados ficam A DEFINIR; os observados no ambiente vão para Observações. No wizard: modo completo ou "somente evidências" |
+| 9 | `09_coleta_evidencias_restore.sh` | Servidor onde a clonagem/restauração executa | Evidências de teste de restauração (Anexo I) com descoberta automática: cron e scripts chamados, varredura por conteúdo e `v$rman_status` dos bancos locais. Classifica BACKUP_RMAN x ACTIVE_DATABASE x DATAPUMP x SQLSERVER x POSTGRESQL (pg_restore) x MYSQL (xtrabackup/mariabackup/myloader) x RESTORE_VALIDATE. RPO/RTO acordados ficam A DEFINIR; os observados no ambiente vão para Observações. No wizard: modo completo ou "somente evidências" |
+| 11 | `11_coleta_postgresql.sh` | Servidor PostgreSQL (postgres, root ou sudo) | Bancos e tamanho, WAL/archive e janela de recuperação ponto no tempo, `pg_stat_archiver`, replicação/standby e atraso, slots, pgBackRest/Barman/WAL-G, `pg_cron` e dumps/basebackups em disco. Fora do padrão: `WISEDB_PG_CONN="host=... user=..."` |
+| 12 | `12_coleta_mysql.sh` | Servidor MySQL/MariaDB (root/unix_socket, sudo ou usuário de leitura) | Binlog e janela de PITR, bancos e tabelas MyISAM, replicação, Galera, criptografia, xtrabackup/mariabackup e dumps em disco. Usuário de leitura: `WISEDB_MY_USER=leitura` |
 | 10 | `99_sanitizar_e_empacotar.sh` | Onde estiver a pasta de coleta | Sempre, antes de enviar |
 
 ## Exemplo completo (cliente com Oracle + SQL Server on Linux + OCI)
@@ -88,6 +100,14 @@ bash 08_coleta_cloud_outras.sh aws PERFIL sa-east-1
 # Sanitizar e empacotar cada pasta gerada:
 bash 99_sanitizar_e_empacotar.sh ./coleta_oraprod_20260901
 ```
+
+## O que o RESUMO entrega para a política (digest v2.5)
+
+Além das seções por tecnologia, o RESUMO traz:
+
+- **INDICADORES 3-2-1-1-0**: para cada critério, os indícios a favor e contra encontrados na coleta e uma situação sugerida (ATENDE para confirmar, PARCIAL, NÃO ATENDE, NÃO EVIDENCIADO). É indício, não veredito: a IA valida contra as seções antes de usar.
+- **`RESUMO_<cliente>_<host>.json`**: o mesmo conteúdo dos indicadores e dos alertas em formato estruturado, para alimentar a aba 3.CONFORMIDADE do Painel.
+- Campos da política que antes ficavam sem evidência: retenção real x documentada (Oracle), criptografia (TDE, peças cifradas, `encryptor_type`, criptografia do Veeam e da chave do bucket), rotinas de verificação (VALIDATE, CHECKDB, health check), monitoramento (notificação nos scripts, agente Zabbix, container de relatório), backup do catálogo da ferramenta (configuração do Veeam) e lacuna de log do SQL Server.
 
 ## Complementos não estruturados (enviar junto, sem tratar)
 

@@ -1,6 +1,10 @@
 <#
 ===============================================================================
  10_coleta_oracle_windows.ps1 - WiseDB | Kit de Coleta para Politica de Backup
+ v1.1 (outubro/2026): mesmas consultas do 02 v1.3 (retencao real, TDE, standby,
+            VALIDATE, corrupcao, FULL sem nivel) e correcao da classificacao do
+            SBT: '-match ra' casava com qualquer caminho contendo "ora" (ex.:
+            C:\oracle\...\ddboostora.dll) e virava Recovery Service.
  v1.0 (outubro/2026)
 
  OBJETIVO : Equivalente Windows do 02_coleta_oracle.sh. Para cada servico
@@ -96,7 +100,8 @@ select input_type,
        to_char(min(start_time),'DD/MM HH24:MI') primeiro,
        to_char(max(start_time),'DD/MM HH24:MI') ultimo,
        round(avg(output_bytes)/1024/1024/1024,2) media_gb,
-       round(max(elapsed_seconds)/60,1) max_min
+       round(max(elapsed_seconds)/60,1) max_min,
+       round(avg(input_bytes_per_sec)/1024/1024,1) mb_s
 from v$rman_backup_job_details where start_time > sysdate-35
 group by input_type order by 1;
 prompt ### RMAN 35 DIAS - HORARIO TIPICO POR TIPO
@@ -105,24 +110,25 @@ from v$rman_backup_job_details where start_time > sysdate-35
 group by input_type, to_char(start_time,'HH24') having count(*) > 2 order by 1,2;
 prompt ### RMAN - NIVEL 0 x NIVEL 1 (por dia, via v$backup_datafile)
 col dia for a12
+col nivel for a6
 select to_char(trunc(completion_time),'DD/MM DY') dia,
-       incremental_level nivel,
+       nvl(to_char(incremental_level),'FULL') nivel,
        count(*) datafiles,
        round(sum(blocks*block_size)/1024/1024/1024,2) gb
 from v$backup_datafile
-where completion_time > sysdate-35 and incremental_level is not null
+where completion_time > sysdate-35 and file# > 0
 group by trunc(completion_time), incremental_level
 order by trunc(completion_time) desc, incremental_level;
 prompt ### RMAN - ULTIMO NIVEL 0 SEM JANELA DE 35 DIAS (evita concluir "sem full")
 prompt ### Em destino gerenciado (Recovery Service/ZDLRA) o nivel 0 pode ser antigo
 prompt ### por design, com consolidacao no proprio servico. Ausencia na janela de
 prompt ### 35 dias NAO significa ausencia de backup full.
-select incremental_level nivel,
+select nvl(to_char(incremental_level),'FULL') nivel,
        to_char(max(completion_time),'DD/MM/YYYY HH24:MI') ultimo,
        round(sysdate - max(completion_time)) dias_atras,
        count(*) datafiles_total
 from v$backup_datafile
-where incremental_level is not null
+where file# > 0
 group by incremental_level order by 1;
 prompt ### RMAN - FALHAS (v$rman_backup_job_details, ultimos 35 dias)
 select * from (select to_char(start_time,'DD/MM/YYYY HH24:MI') inicio, input_type, status
@@ -200,6 +206,72 @@ col job_name for a40
 col repeat_interval for a45
 select owner||'.'||job_name job_name, enabled, state, repeat_interval
 from dba_scheduler_jobs
+prompt ### TAMANHO (v$datafile, vale tambem para 11g sem CDB)
+select round(sum(bytes)/1024/1024/1024,2) total_gb from v$datafile;
+prompt ### RETENCAO REAL - BACKUP DE DATAFILE MAIS ANTIGO DISPONIVEL (status A) POR DEVICE E NIVEL (comparar com a RETENTION POLICY; sem catalogo RMAN e limitado pelo control_file_record_keep_time)
+col device for a10
+col nivel for a6
+select p.device_type device, nvl(to_char(d.incremental_level),'FULL') nivel,
+       to_char(min(d.completion_time),'DD/MM/YYYY HH24:MI') mais_antigo,
+       round(sysdate-min(d.completion_time)) dias_retidos,
+       to_char(max(d.completion_time),'DD/MM/YYYY HH24:MI') mais_recente,
+       count(distinct d.set_stamp||'.'||d.set_count) backupsets
+from v$backup_datafile d, v$backup_piece p
+where p.set_stamp = d.set_stamp and p.set_count = d.set_count
+  and p.status = 'A' and d.file# > 0
+group by p.device_type, d.incremental_level order by 1,2;
+prompt ### RETENCAO REAL - ARCHIVELOG MAIS ANTIGO EM BACKUP DISPONIVEL POR DEVICE
+select p.device_type device, to_char(min(r.first_time),'DD/MM/YYYY HH24:MI') mais_antigo,
+       round(sysdate-min(r.first_time)) dias_retidos,
+       to_char(max(r.next_time),'DD/MM/YYYY HH24:MI') mais_recente
+from v$backup_redolog r, v$backup_piece p
+where p.set_stamp = r.set_stamp and p.set_count = r.set_count and p.status = 'A'
+group by p.device_type order by 1;
+prompt ### PARAMETROS QUE LIMITAM A RECUPERACAO
+col name for a32
+col value for a40
+select name, value from v$parameter
+where name in ('control_file_record_keep_time','db_flashback_retention_target','db_recovery_file_dest_size','archive_lag_target','log_archive_format')
+order by name;
+prompt ### FLASHBACK DATABASE E RESTORE POINTS
+select flashback_on from v$database;
+col rp_name for a30
+select name rp_name, to_char(time,'DD/MM/YYYY HH24:MI') criado, guarantee_flashback_database garantido from v$restore_point;
+prompt ### BLOCK CHANGE TRACKING (acelera o incremental e reduz a janela de backup)
+col filename for a60
+select status, filename from v$block_change_tracking;
+prompt ### CRIPTOGRAFIA - WALLET/KEYSTORE TDE (backup de banco cifrado nao restaura sem o wallet)
+col wrl_parameter for a50
+select * from v$encryption_wallet;
+select count(*) tablespaces_cifrados from v$encrypted_tablespaces;
+prompt ### CRIPTOGRAFIA E COMPRESSAO DAS PECAS DE BACKUP (35 DIAS)
+select device_type device, encrypted cifrado, compressed comprimido, count(*) pecas
+from v$backup_piece where completion_time > sysdate-35 and status = 'A'
+group by device_type, encrypted, compressed order by 1;
+prompt ### ROTINAS DE VERIFICACAO (VALIDATE / CROSSCHECK / DELETE, 35 DIAS)
+col operacao for a28
+select operation operacao, count(*) execucoes, to_char(max(start_time),'DD/MM/YYYY HH24:MI') ultima,
+       sum(case when status like '%FAILED%' or status like '%ERRORS%' then 1 else 0 end) com_erro
+from v$rman_status
+where start_time > sysdate-35
+  and (operation like '%VALIDATE%' or operation like '%CROSSCHECK%' or operation like 'DELETE%')
+group by operation order by 1;
+prompt ### CORRUPCAO DE BLOCOS REGISTRADA (v$database_block_corruption)
+select count(*) blocos_corrompidos from v$database_block_corruption;
+prompt ### DATA GUARD - DESTINOS REMOTOS (visao do primario: erro e sequencia aplicada)
+col erro for a50
+select dest_id, status, type, database_mode, recovery_mode, archived_seq#, applied_seq#, substr(error,1,50) erro
+from v$archive_dest_status where status <> 'INACTIVE' and type <> 'LOCAL';
+prompt ### STANDBY - ATRASO (somente quando ESTE banco e standby, inclusive standby manual)
+select d.database_role papel, d.open_mode,
+       to_char(max(h.checkpoint_time),'DD/MM/YYYY HH24:MI:SS') aplicado_ate,
+       round((sysdate - max(h.checkpoint_time))*24*60) atraso_min
+from v$database d, v$datafile_header h
+where d.database_role like '%STANDBY%' and h.status = 'ONLINE'
+group by d.database_role, d.open_mode;
+col name for a24
+col value for a20
+select name, value, time_computed from v$dataguard_stats;
 where upper(job_name) like '%BKP%' or upper(job_name) like '%BACKUP%' or upper(job_name) like '%EXP%';
 exit
 '@
@@ -239,8 +311,10 @@ foreach ($sid in $Sids) {
           "################################################################")
   if ($r -match "SBT_LIBRARY=([^,' ]+)") {
     $lib = $Matches[1]; $sb += "SBT_LIBRARY: $lib"
-    if ($lib -match 'opc') { $sb += "Tipo de destino (inferido): OCI Object Storage via Database Cloud Backup Module" }
-    elseif ($lib -match 'ra') { $sb += "Tipo de destino (inferido): OCI Recovery Service / Recovery Appliance (DBRS)" }
+    $leaf = Split-Path $lib -Leaf
+    if ($leaf -match '(?i)opc') { $sb += "Tipo de destino (inferido): OCI Object Storage via Database Cloud Backup Module" }
+    elseif ($leaf -match '(?i)^(lib)?ra\.(dll|so)$|orasbtra|libra') { $sb += "Tipo de destino (inferido): OCI Recovery Service / Recovery Appliance (DBRS)" }
+    elseif ($leaf -match '(?i)ddbo|ddboost|libddobk') { $sb += "Tipo de destino (inferido): appliance de terceiro (Data Domain)" }
     else { $sb += "Tipo de destino (inferido): appliance de terceiro ou nao reconhecido" }
   } else { $sb += "Nenhum SBT_LIBRARY declarado no SHOW ALL: backup fisico provavelmente so em DISK" }
   $sb | Out-File "${F}_destino_sbt.txt" -Encoding utf8
