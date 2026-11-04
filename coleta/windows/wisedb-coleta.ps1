@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  WiseDB coleta (Windows) v1.0.0. Descobre SQL Server e Oracle, coleta metadados
+  WiseDB coleta (Windows) v1.0.1. Descobre SQL Server e Oracle, coleta metadados
   SOMENTE LEITURA, monta um JSON (contrato wisedb.coleta/1) e envia por HTTPS PUT
   para um link PAR da OCI.
 
@@ -45,7 +45,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$script:AgenteVersao = '1.0.0'
+$script:AgenteVersao = '1.0.1'
 $script:Schema = 'wisedb.coleta/1'
 $script:TaskName = 'WiseDB Coleta'
 $script:ExitCode = 0
@@ -979,7 +979,7 @@ function Invoke-Main {
     $hostInfo = Get-HostInfo
 
     if ($Descobrir) {
-        $inv = Invoke-Descoberta $false
+        $inv = @(Invoke-Descoberta $false)
         $n = Get-NuvemMeta
         Write-Msg ("Host: $($hostInfo.nome) | SO: $($hostInfo.so) | Nuvem: $(if ($n.provedor) { $n.provedor } else { 'nenhuma detectada' })")
         Write-Msg ("CLIs de nuvem: " + $(if ((Get-ClisNuvem).Count) { (Get-ClisNuvem) -join ', ' } else { '(nenhuma)' }))
@@ -998,9 +998,9 @@ function Invoke-Main {
     if ($enviar -and (-not $lnk -or $lnk -notmatch '^https://')) { Write-Msg 'Informe -Link (URL https do PAR) ou use -Coletar -Saida.'; return 3 }
     if ($enviar) { Write-Msg "Destino: $(Get-LinkMascarado $lnk)" }
 
-    $inv = Invoke-Descoberta $true
+    $inv = @(Invoke-Descoberta $true)
     $n = Get-NuvemMeta
-    $clis = Get-ClisNuvem
+    $clis = @(Get-ClisNuvem)
     $env_ = New-Envelope $cli $inv $hostInfo $n $clis
     $okInst = @($inv | Where-Object { $_.acesso -eq 'ok' }).Count
     Write-Msg "Instancias: $($inv.Count) (acesso ok: $okInst). Crescimento: $($script:Cresc.Count) linhas. Backups: $($script:Back.Count) linhas. Avisos: $($script:Avisos.Count)."

@@ -43,7 +43,15 @@ Agendar (grava o conf e 1 linha no crontab do root; o cron baixa a mesma URL, co
 
 Link: `--link` > variável `WISEDB_LINK` > `/etc/wisedb/coleta.conf`. O link **nunca** é impresso inteiro (só 30 caracteres). Prefira o conf ou `WISEDB_LINK` ao `--link`, porque argumentos aparecem em `ps`.
 
-Variáveis opcionais, lidas só na execução e nunca gravadas em JSON, conf ou log: `WISEDB_MSSQL_USER` e `WISEDB_MSSQL_PASS` (SQL Server; a senha vai por `SQLCMDPASSWORD`), `WISEDB_MONGO_URI` (MongoDB com autenticação; a URI aparece em `ps` durante a consulta).
+Variáveis opcionais, nunca gravadas em JSON, conf ou log: `WISEDB_MSSQL_USER` e `WISEDB_MSSQL_PASS` (SQL Server; a senha vai por `SQLCMDPASSWORD`), `WISEDB_MONGO_URI` (MongoDB com autenticação; a URI aparece em `ps` durante a consulta; caracteres especiais da senha em %XX).
+
+O cron roda sem essas variáveis. Para a coleta agendada, grave-as uma vez em `/etc/wisedb/credenciais` (root, 600; ignorado se a permissão for outra):
+
+```bash
+read -rp 'usuario SQL: ' U; read -rsp 'senha: ' P; echo; sudo WISEDB_MSSQL_USER="$U" WISEDB_MSSQL_PASS="$P" bash /tmp/wisedb-coleta.sh --gravar-credenciais; unset P
+```
+
+Para MongoDB, o mesmo com `WISEDB_MONGO_URI='mongodb://usuario:senha@127.0.0.1:27017/?authSource=admin'`. Usuário mínimo no SQL Server: login com `VIEW ANY DEFINITION`, `CONNECT ANY DATABASE` (2014+) e leitura no `msdb`.
 
 ## Descoberta e autenticação
 

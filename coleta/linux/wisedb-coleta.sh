@@ -21,7 +21,7 @@
 #   4 havia instancias e nenhuma foi coletada | 5 falha ao montar o JSON/gzip
 #   6 falha no envio | 7 falha no agendamento/configuracao
 #==============================================================================
-WIZ_VERSAO="1.0.0"
+WIZ_VERSAO="1.0.1"
 SCHEMA_ID="wisedb.coleta/1"
 
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
@@ -57,6 +57,7 @@ Uso:
   (padrao)                        coleta e envia ao link PAR
   --agendar diario|semanal        grava $CONF_PADRAO (600) e 1 linha no crontab do root
   --remover-agendamento           remove a linha do crontab (--apagar-conf apaga tambem o conf)
+  --gravar-credenciais            grava WISEDB_MSSQL_*/WISEDB_MONGO_URI do ambiente em <dir do conf>/credenciais (600); o cron le este arquivo
   --enviar-arquivo ARQ.json.gz    reenvia um arquivo gerado antes por --coletar (nao coleta)
 Parametros:
   --cliente ID        identificador do cliente (A-Z a-z 0-9 . _ -)
@@ -115,6 +116,7 @@ parse_args() {
             --enviar-arquivo) [ $# -ge 2 ] || { echo "falta o valor de --enviar-arquivo" >&2; exit 1; }
                               MODO="enviar"; ARQ_ENVIO="$2"; shift 2 ;;
             --apagar-conf) APAGAR_CONF=1; shift ;;
+            --gravar-credenciais) MODO="gravarcred"; shift ;;
             --cliente) [ $# -ge 2 ] || { echo "falta o valor de --cliente" >&2; exit 1; }; CLIENTE="$2"; shift 2 ;;
             --link) [ $# -ge 2 ] || { echo "falta o valor de --link" >&2; exit 1; }; LINK="$2"; shift 2 ;;
             --saida) [ $# -ge 2 ] || { echo "falta o valor de --saida" >&2; exit 1; }; SAIDA="$2"; shift 2 ;;
@@ -156,6 +158,53 @@ ler_conf() {
     done < "$CONF"
 }
 
+
+# Credenciais opcionais para execucao SEM ambiente (cron): <dir do conf>/credenciais (600, dono root).
+# Linhas CHAVE=VALOR, so WISEDB_MSSQL_USER, WISEDB_MSSQL_PASS e WISEDB_MONGO_URI. Variavel ja
+# definida no ambiente tem prioridade. Lido em tempo de execucao; nunca vai para JSON, log ou conf.
+CRED_ARQ=""
+ler_credenciais() {
+    CRED_ARQ="$(dirname "$CONF")/credenciais"
+    [ -f "$CRED_ARQ" ] || return 0
+    local mode owner l k v
+    mode=$(stat -c %a "$CRED_ARQ" 2>/dev/null || echo 777)
+    owner=$(stat -c %u "$CRED_ARQ" 2>/dev/null || echo 9999)
+    case "$mode" in
+        600|400) ;;
+        *) log ERRO "$CRED_ARQ com permissao insuficiente ($mode); use chmod 600; credenciais ignoradas"; return 0 ;;
+    esac
+    if [ "$owner" != "0" ] && [ "$owner" != "$EUID" ]; then log ERRO "$CRED_ARQ pertence a outro usuario; ignorado"; return 0; fi
+    while IFS= read -r l || [ -n "$l" ]; do
+        l=${l%$'\r'}
+        case "$l" in ""|"#"*) continue ;; esac
+        k=${l%%=*}; v=${l#*=}
+        case "$k" in
+            WISEDB_MSSQL_USER) [ -n "${WISEDB_MSSQL_USER:-}" ] || export WISEDB_MSSQL_USER=$v ;;
+            WISEDB_MSSQL_PASS) [ -n "${WISEDB_MSSQL_PASS:-}" ] || export WISEDB_MSSQL_PASS=$v ;;
+            WISEDB_MONGO_URI) [ -n "${WISEDB_MONGO_URI:-}" ] || export WISEDB_MONGO_URI=$v ;;
+        esac
+    done < "$CRED_ARQ"
+}
+
+# --gravar-credenciais: grava as variaveis WISEDB_MSSQL_USER/PASS e WISEDB_MONGO_URI do ambiente atual
+do_gravar_cred() {
+    if [ "$EUID" -ne 0 ]; then echo "--gravar-credenciais exige root" >&2; exit 7; fi
+    local dir arq k v n=0 tmpc
+    dir=$(dirname "$CONF"); arq="$dir/credenciais"
+    mkdir -p "$dir" && chmod 700 "$dir" || { echo "nao consegui criar $dir" >&2; exit 7; }
+    tmpc="$arq.tmp.$$"
+    : > "$tmpc" && chmod 600 "$tmpc" || { echo "nao consegui gravar $arq" >&2; exit 7; }
+    for k in WISEDB_MSSQL_USER WISEDB_MSSQL_PASS WISEDB_MONGO_URI; do
+        v=${!k:-}
+        [ -n "$v" ] || continue
+        case "$v" in *$'\n'*|*$'\r'*) rm -f "$tmpc"; echo "$k contem quebra de linha; nao gravado" >&2; exit 7 ;; esac
+        printf '%s=%s\n' "$k" "$v" >> "$tmpc"; n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then rm -f "$tmpc"; echo "defina WISEDB_MSSQL_USER/PASS e/ou WISEDB_MONGO_URI no ambiente (sudo -E)" >&2; exit 1; fi
+    mv -f "$tmpc" "$arq" || { rm -f "$tmpc"; echo "nao consegui gravar $arq" >&2; exit 7; }
+    echo "Credenciais gravadas em $arq (600, root): $n variavel(is). Lidas so na execucao; nunca vao para JSON ou log."
+    exit 0
+}
 valida_cliente() { case "$1" in ""|*[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
 valida_link() { case "$1" in https://*/o/) ;; *) return 1 ;; esac; case "$1" in *[!A-Za-z0-9._~:/%@+=-]*) return 1 ;; esac; return 0; }
 link_curto() { printf '%s...' "${LINK:0:30}"; }
@@ -174,7 +223,7 @@ init_ambiente() {
     trap 'rm -rf "$W"' EXIT
     trap 'exit 130' INT TERM
     : > "$W/inv.tsv"; : > "$W/cresc.tsv"; : > "$W/bk.tsv"; : > "$W/avisos.tsv"; : > "$W/found.dat"
-    HOST_NOME=$(hostname -s 2>/dev/null || hostname 2>/dev/null)
+    HOST_NOME=$(hostname -s 2>/dev/null || hostname 2>/dev/null || uname -n 2>/dev/null)
     HOST_NOME=$(printf '%s' "$HOST_NOME" | tr -cd 'A-Za-z0-9_.-')
     [ -n "$HOST_NOME" ] || HOST_NOME="host"
     HOST_SO=$( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-$NAME}" )
@@ -290,7 +339,7 @@ found_mssql() {
     for p in /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd "$(command -v sqlcmd 2>/dev/null)"; do
         [ -n "$p" ] && [ -x "$p" ] && { cli=$p; break; }
     done
-    found sqlserver "$port" "$owner" "$port" "$cli" "$pid"
+    grep -q "^sqlserver|$port|" "$W/found.dat" 2>/dev/null || found sqlserver "$port" "$owner" "$port" "$cli" "$pid"
     MSSQL_EMITIDO=1
 }
 
@@ -339,7 +388,7 @@ found_mongo() {
 found_container() { # nome-do-processo pid ns
     local b=$1 ns=$3 motor inst=""
     case "$b" in
-        ora_pmon_*) motor=oracle; inst="container-${b#ora_pmon_}" ;;
+        ora_pmon_*|xe_pmon_*) motor=oracle; inst="container-${b#*_pmon_}" ;;
         sqlservr) motor=sqlserver ;;
         mysqld|mariadbd) motor=mysql ;;
         mongod) motor=mongodb ;;
@@ -362,14 +411,14 @@ scan_processos() {
         [ -n "$a0" ] || continue
         b=${a0##*/}
         case "$b" in
-            ora_pmon_*|sqlservr|mysqld|mariadbd|mongod) ;;
+            ora_pmon_*|xe_pmon_*|sqlservr|mysqld|mariadbd|mongod) ;;
             postgres|postmaster) case "$a0" in *": "*) continue ;; esac ;;
             *) continue ;;
         esac
         ns=$(readlink "$d/ns/net" 2>/dev/null)
         if [ -n "$selfns" ] && [ -n "$ns" ] && [ "$ns" != "$selfns" ]; then found_container "$b" "$pid" "$ns"; continue; fi
         case "$b" in
-            ora_pmon_*) found_oracle "$pid" "${b#ora_pmon_}" ;;
+            ora_pmon_*|xe_pmon_*) found_oracle "$pid" "${b#*_pmon_}" ;;
             sqlservr) found_mssql "$pid" ;;
             mysqld|mariadbd) found_mysql "$pid" ;;
             postgres|postmaster) case "$a0" in *": "*) ;; *) found_pg "$pid" ;; esac ;;
@@ -726,7 +775,7 @@ probe_sqlserver() {
     fi
     local out rc
     out=$(ms_sql "SELECT 'VER|' + CAST(SERVERPROPERTY('ProductVersion') AS varchar(50));
-SELECT 'DB|' + d.name + '|' + d.state_desc FROM sys.databases d WHERE d.database_id <> 2;
+SELECT 'DB|' + d.name COLLATE DATABASE_DEFAULT + '|' + d.state_desc COLLATE DATABASE_DEFAULT FROM sys.databases d WHERE d.database_id <> 2;
 GO"); rc=$?
     VERSAO=$(printf '%s\n' "$out" | sed -n 's/^VER|//p' | head -n 1 | tr -cd 'A-Za-z0-9._-')
     if [ $rc -eq 0 ] && [ -n "$VERSAO" ]; then
@@ -1153,7 +1202,7 @@ do_agendar() {
         printf 'CLIENTE_ID=%s\nLINK_PAR=%s\nURL_WIZARD=%s\nSHA256_WIZARD=%s\n' "$cli" "$lnk" "$url" "$sha"
     } > "$tmpc" && chmod 600 "$tmpc" && mv -f "$tmpc" "$CONF" || { echo "nao consegui gravar $CONF" >&2; exit 7; }
     local h hn min hora dia expr
-    hn=$(hostname -s 2>/dev/null || echo host)
+    hn=$(hostname -s 2>/dev/null || uname -n 2>/dev/null || echo host)
     h=$(printf '%s' "$hn$cli" | cksum | awk '{print $1}')
     min=$((h % 60)); hora=$(( (h / 60) % 4 + 1 )); dia=1
     if [ "$AGENDA" = "semanal" ]; then expr="$min $hora * * $dia"; else expr="$min $hora * * *"; fi
@@ -1188,6 +1237,7 @@ do_remover() {
 }
 
 #------------------------------------------------------------------ principal
+LOCKF=""
 trava() {
     local lf
     if [ "$EUID" -eq 0 ]; then lf=/var/lock/wisedb-coleta.lock; else lf="${TMPDIR:-/tmp}/wisedb-coleta-$EUID.lock"; fi
@@ -1197,7 +1247,8 @@ trava() {
         flock -n 9 || { log ERRO "outra execucao em andamento (lock $lf)"; exit 2; }
     else
         mkdir "$lf.d" 2>/dev/null || { log ERRO "outra execucao em andamento (lock $lf.d)"; exit 2; }
-        trap 'rmdir "$lf.d" 2>/dev/null; rm -rf "$W"' EXIT
+        LOCKF=$lf
+        trap 'rmdir "$LOCKF.d" 2>/dev/null; rm -rf "$W"' EXIT
     fi
 }
 
@@ -1226,6 +1277,8 @@ main() {
     [ "$MODO" != "remover" ] || do_remover
     init_ambiente
     ler_conf
+    [ "$MODO" != "gravarcred" ] || do_gravar_cred
+    ler_credenciais
     [ -n "$CLIENTE" ] || CLIENTE=$C_CLIENTE
     [ -n "$LINK" ] || LINK=${WISEDB_LINK:-$C_LINK}
     [ "$MODO" != "agendar" ] || do_agendar

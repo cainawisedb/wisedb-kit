@@ -1,4 +1,4 @@
-# WiseDB coleta (Windows) v1.0.0
+# WiseDB coleta (Windows) v1.0.1
 
 Script único (`wisedb-coleta.ps1`) que descobre SQL Server e Oracle, coleta **só metadados, somente leitura**, monta um JSON (`wisedb.coleta/1`, ver `contrato/CONTRATO_v1.md`) e envia por HTTPS PUT a um link PAR da OCI (grava só no prefixo do cliente; não lê nem apaga). MySQL, PostgreSQL e MongoDB são apenas detectados (serviço).
 
@@ -6,7 +6,7 @@ Script único (`wisedb-coleta.ps1`) que descobre SQL Server e Oracle, coleta **s
 
 - Windows Server 2012 R2 ou superior com **PowerShell 5.1** (2012 R2 precisa do WMF 5.1). Sem módulos externos, sem instalação.
 - Saída HTTPS (443) para `objectstorage.<região>.oraclecloud.com`.
-- SQL Server: o usuário que roda precisa de login (autenticação integrada) com `VIEW ANY DEFINITION` e `VIEW ANY DATABASE`, e leitura em `msdb` (`backupset`, `backupmediafamily`; jobs: `SQLAgentReaderRole`). Instância nomeada usa `localhost\NOME` (precisa do serviço SQL Browser ou porta fixa).
+- SQL Server: o usuário que roda precisa de login (autenticação integrada) com `VIEW ANY DEFINITION` e `CONNECT ANY DATABASE` (ver Permissões da conta SYSTEM). Instância nomeada usa `localhost\NOME` (precisa do serviço SQL Browser ou porta fixa).
 - Oracle: `sqlplus.exe` (PATH, `ORACLE_HOME` ou registro) e usuário do Windows no grupo `ORA_DBA` (`/ as sysdba`). Nenhuma senha é pedida.
 - Agendar/remover: PowerShell como **Administrador**.
 
@@ -15,10 +15,10 @@ Script único (`wisedb-coleta.ps1`) que descobre SQL Server e Oracle, coleta **s
 Substitua `<ORG/REPO/TAG>`, `<SHA256>`, `<ID>` e `<LINK_PAR>` (o link termina em `/o/`):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $u='https://raw.githubusercontent.com/<ORG/REPO/TAG>/windows/wisedb-coleta.ps1'; $h='<SHA256>'; $f="$env:TEMP\wisedb-coleta.ps1"; iwr $u -UseBasicParsing -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne $h){ throw 'SHA-256 diferente: nao execute' }; & $f -Cliente <ID> -Link '<LINK_PAR>'
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $u='https://raw.githubusercontent.com/<ORG/REPO/TAG>/windows/wisedb-coleta.ps1'; $h='<SHA256>'; $f="$env:TEMP\wisedb-coleta.ps1"; iwr $u -UseBasicParsing -OutFile $f; if((Get-FileHash $f -Algorithm SHA256).Hash -ne $h){ throw 'SHA-256 diferente: nao execute' }; $p="$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"; & $p -NoProfile -ExecutionPolicy Bypass -File $f -Cliente <ID> -Link '<LINK_PAR>'
 ```
 
-Para agendar (como Administrador), acrescente `-Agendar Semanal -UrlScript $u -Sha256 $h` ao final.
+Para agendar (como Administrador), repita a última parte com `-Agendar Semanal -UrlScript $u -Sha256 $h` ao final. O `-ExecutionPolicy Bypass` vale só para esse processo (funciona com política Restricted ou AllSigned local; não contorna GPO que force AllSigned).
 
 ## Opções
 
@@ -56,13 +56,19 @@ Códigos de saída: 0 ok (inclui coleta parcial, veja `avisos`); 1 uso; 2 exige 
 No SQL Server a conta `NT AUTHORITY\SYSTEM` não é sysadmin por padrão. O DBA decide e executa (o script não altera nada), por exemplo:
 
 ```sql
-CREATE LOGIN [NT AUTHORITY\SYSTEM] FROM WINDOWS;
-GRANT VIEW ANY DATABASE TO [NT AUTHORITY\SYSTEM];
+-- minimo testado (SQL Server 2014+): crescimento (bases e filegroups) e backups completos
+IF SUSER_ID(N'NT AUTHORITY\SYSTEM') IS NULL CREATE LOGIN [NT AUTHORITY\SYSTEM] FROM WINDOWS;
 GRANT VIEW ANY DEFINITION TO [NT AUTHORITY\SYSTEM];
-USE msdb; CREATE USER [NT AUTHORITY\SYSTEM] FOR LOGIN [NT AUTHORITY\SYSTEM];
-ALTER ROLE db_datareader ADD MEMBER [NT AUTHORITY\SYSTEM];
-ALTER ROLE SQLAgentReaderRole ADD MEMBER [NT AUTHORITY\SYSTEM];
+GRANT CONNECT ANY DATABASE TO [NT AUTHORITY\SYSTEM];
+-- opcional: aviso de falhas de job de backup (SQLAgentReaderRole NAO basta)
+USE msdb;
+IF USER_ID(N'NT AUTHORITY\SYSTEM') IS NULL CREATE USER [NT AUTHORITY\SYSTEM] FOR LOGIN [NT AUTHORITY\SYSTEM];
+GRANT SELECT ON dbo.sysjobs TO [NT AUTHORITY\SYSTEM];
+GRANT SELECT ON dbo.sysjobhistory TO [NT AUTHORITY\SYSTEM];
+GRANT SELECT ON dbo.sysjobsteps TO [NT AUTHORITY\SYSTEM];
 ```
+
+Sem esses GRANT, a tarefa agendada envia só os backups (o `msdb` é legível por `guest`) e o crescimento sai vazio. SQL Server 2012 não tem `CONNECT ANY DATABASE`: crie o usuário em cada base ou use uma conta de serviço.
 
 Alternativa: agendar manualmente com uma conta de serviço do domínio que já tenha esses acessos.
 
